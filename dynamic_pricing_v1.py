@@ -301,11 +301,28 @@ def train_and_eval(df_daily, horizon_weeks=12, use_progress=False):
     # --- Train model ---
     model = LinUCB(nchoices=len(ARMS), alpha=1.0, fit_intercept=True, random_state=42)
 
+        # --- Train model ---
+    model = LinUCB(nchoices=len(ARMS), alpha=1.0, fit_intercept=True, random_state=42)
+
     for _, row in train_df.iterrows():
         X = build_features(row).reshape(1, -1)
-        a = BASELINE_ARM_IDX
-        r = row["SALE_QTY_TOTAL"]
-        model.fit(X, np.array([a]), np.array([r]))
+
+        # observed sales at baseline price
+        base_price = row["SALE_PRICE"]
+        base_sales = row["SALE_QTY_TOTAL"]
+
+        # for each arm, simulate reward using simple price–demand elasticity assumption
+        for arm_idx, mult in enumerate(ARMS):
+            price = row["BASE_PRICE"] * mult
+
+            # elasticity proxy: assume demand changes inversely with price ratio
+            demand = base_sales * (base_price / price) if price > 0 else base_sales
+
+            # reward: revenue = price × demand
+            reward = price * demand
+
+            model.fit(X, np.array([arm_idx]), np.array([reward]))
+
 
     # --- Evaluate last horizon_weeks ---
     eval_results = []
