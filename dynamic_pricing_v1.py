@@ -312,16 +312,22 @@ def train_and_eval(df_daily, horizon_weeks=12, use_progress=False):
         base_sales = row["SALE_QTY_TOTAL"]
 
         # for each arm, simulate reward using simple price–demand elasticity assumption
+                # assume constant price elasticity of demand
+        elasticity = -1.5  # typical retail elasticity, tune per category
+
         for arm_idx, mult in enumerate(ARMS):
             price = row["BASE_PRICE"] * mult
+            if price <= 0:
+                continue
 
-            # elasticity proxy: assume demand changes inversely with price ratio
-            demand = base_sales * (base_price / price) if price > 0 else base_sales
+            # demand relative to baseline
+            demand = base_sales * (price / base_price) ** elasticity
 
-            # reward: revenue = price × demand
+            # reward = revenue
             reward = price * demand
 
             model.fit(X, np.array([arm_idx]), np.array([reward]))
+
 
 
     # --- Evaluate last horizon_weeks ---
