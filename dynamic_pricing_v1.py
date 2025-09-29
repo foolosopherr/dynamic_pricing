@@ -305,107 +305,173 @@ class HierLinUCB:
         return a
 
 # ---------------- training & prediction ----------------
-def train_and_eval(df_daily, horizon_weeks=12):
+def train_and_eval(df_daily, arms=ARMS, alpha=1.0, min_n=10, report_last_weeks=12):
     """
-    Rolling evaluation with bandit updates.
-    - For each of the last horizon_weeks: train on all previous weeks (row by row update),
-      then predict for that week.
-    - Finally: retrain on all history and predict next week.
+    Rolling walk-forward:
+      - sort weeks chronologically
+      - for each week W: choose prices using model trained on weeks < W,
+        log the recommendation & realized outcome, then update the model with week W
+      - after the last history week (ending 2025-09-14), predict next week (2025-09-15..21)
+
+    Returns:
+      rolling_eval_df: per-bucket rolling eval across all historical weeks
+      eval_lastN_df : last `report_last_weeks` weeks from rolling eval
+      nextweek_df   : recommendations for 2025-09-15..2025-09-21 (Mon..Sun)
     """
-    df = prepare(df_daily)
+    # ---------- prep + features ----------
+    df = prepare(df_daily)        # must set TRADE_DT, WEEK_START (Mon), DAY_BUCKET
     df = add_features(df)
 
-    # --- aggregate data ---
-    agg = df.groupby(
-        ["STORE","PRODUCT_CODE","FAMILY_CODE","CATEGORY_CODE","SEGMENT_CODE","WEEK_START","DAY_BUCKET"],
-        as_index=False
-    ).agg(
-        BASE_PRICE=("BASE_PRICE","last"),
-        SALE_QTY_TOTAL=("SALE_QTY_TOTAL","sum"),
-        IS_PROMO=("IS_PROMO","max"),
-        discount=("discount","last"),
-        SALE_QTY_7=("SALE_QTY_7","last"),
-        SALE_QTY_28=("SALE_QTY_28","last"),
-        RETURN_RATIO=("RETURN_RATIO","last"),
-        stock_cover=("stock_cover","last"),
-        week_of_year=("week_of_year","last"),
-        month=("month","last"),
-        is_holiday=("is_holiday","max"),
-    )
+    # ---------- aggregate to decision buckets (KEEPING all fields) ----------
+    keys = ["STORE","PRODUCT_CODE","FAMILY_CODE","CATEGORY_CODE","SEGMENT_CODE","WEEK_START","DAY_BUCKET"]
+    agg = (df.groupby(keys, as_index=False)
+             .agg(
+                # core prices and qtys
+                BASE_PRICE=("BASE_PRICE","last"),
+                SALE_PRICE=("SALE_PRICE","last"),
+                SALE_PRICE_ONLINE=("SALE_PRICE_ONLINE","last"),
+                SALE_QTY=("SALE_QTY","sum"),
+                SALE_QTY_ONLINE=("SALE_QTY_ONLINE","sum"),
+                SALE_QTY_TOTAL=("SALE_QTY_TOTAL","sum"),
+                NET_QTY=("NET_QTY","sum"),
+                LOSS_QTY=("LOSS_QTY","sum"),
+                RETURN_QTY=("RETURN_QTY","sum"),
+                DELIVERY_QTY=("DELIVERY_QTY","sum"),
+                START_STOCK=("START_STOCK","last"),
+                END_STOCK=("END_STOCK","last"),
 
-    max_week = agg["WEEK_START"].max()
-    eval_start = max_week - pd.Timedelta(weeks=horizon_weeks-1)
+                # store-level meta
+                REGION_NAME=("REGION_NAME","last"),
+                STORE_TYPE=("STORE_TYPE","last"),
+                PLACE_TYPE=("PLACE_TYPE","last"),
 
-    eval_results = []
+                # engineered (existing + extended)
+                discount=("discount","last"),
+                online_price_ratio=("online_price_ratio","last"),
+                SALE_QTY_7=("SALE_QTY_7","last"),
+                SALE_QTY_28=("SALE_QTY_28","last"),
+                RETURN_RATIO=("RETURN_RATIO","last"),
+                stock_cover=("stock_cover","last"),
+                stock_change=("stock_change","last"),
+                delivery_ratio=("delivery_ratio","last"),
+                is_in_promo=("IS_PROMO","max"),
+                is_in_promo_period=("is_in_promo_period","max"),
+                competitor_on_promo=("competitor_on_promo","mean"),
+                week_of_year=("week_of_year","last"),
+                month=("month","last"),
+                is_holiday=("is_holiday","max"),
 
-    # --- Rolling evaluation ---
-    for week in sorted(agg["WEEK_START"].unique()):
-        if week < eval_start:
-            continue
+                # NEW lifecycle & assortment
+                weeks_since_first_seen=("weeks_since_first_seen","last"),
+                family_assortment_width=("family_assortment_width","last"),
+                active_siblings=("active_siblings","last"),
 
-        train_df = agg[agg["WEEK_START"] < week]
-        test_df  = agg[agg["WEEK_START"] == week]
+                # NEW price gaps & z-scores
+                price_gap_vs_family_med=("price_gap_vs_family_med","last"),
+                price_gap_vs_family_min=("price_gap_vs_family_min","last"),
+                zprice_family=("zprice_family","last"),
+                zprice_category=("zprice_category","last"),
 
-        if train_df.empty or test_df.empty:
-            continue
+                # NEW momentum
+                fam_momentum=("fam_momentum","last"),
+                cat_momentum=("cat_momentum","last"),
 
-        # init fresh bandit
-        model = LinUCB(nchoices=len(ARMS), alpha=1.0, fit_intercept=True, random_state=42)
+                # NEW charm pricing
+                price_ends_99=("price_ends_99","max"),
+                price_ends_95=("price_ends_95","max"),
+                price_ends_49=("price_ends_49","max"),
 
-        # === reuse your code for training (row-by-row update) ===
-        for _, row in train_df.iterrows():
-            X = build_features(row).reshape(1, -1)
-            a = BASELINE_ARM_IDX
-            r = row["SALE_QTY_TOTAL"]
-            model.fit(X, np.array([a]), np.array([r]))
+                # NEW promo timing within period
+                promo_days_since_start=("promo_days_since_start","last"),
+                promo_days_until_end=("promo_days_until_end","last"),
+                promo_is_mid=("promo_is_mid","max"),
 
-        # === reuse your code for evaluation (predict current week) ===
-        for _, row in test_df.iterrows():
-            X = build_features(row).reshape(1, -1)
-            arm = model.predict(X)[0]
-            price = row["BASE_PRICE"] * ARMS[arm]
-            eval_results.append({
-                "STORE": row["STORE"],
-                "PRODUCT_CODE": row["PRODUCT_CODE"],
-                "WEEK_START": week,
-                "DAY_BUCKET": row["DAY_BUCKET"],
-                "BASE_PRICE": row["BASE_PRICE"],
-                "CHOSEN_ARM": arm,
-                "CHOSEN_PRICE": price,
-                "ACTUAL_SALES": row["SALE_QTY_TOTAL"],
+                # NEW stockout risk
+                stockout_risk=("stockout_risk","last"),
+             ))
+
+    # ---------- rolling walk-forward ----------
+    policy = HierLinUCB(arms=arms, alpha=alpha, min_n=min_n)
+
+    week_list = np.sort(agg["WEEK_START"].unique())
+    rolling_rows = []
+
+    # walk-forward over all available weeks
+    for wk in week_list:
+        wk_rows = agg[agg["WEEK_START"] == wk].sort_values(["STORE","PRODUCT_CODE","DAY_BUCKET"])
+        for _, row in wk_rows.iterrows():
+            rd = row.to_dict()
+            X  = build_features(rd)
+
+            # choose price for this week using knowledge from previous weeks
+            arm = policy.safe_choose(rd, X, fallback_arm=BASELINE_ARM_IDX)
+            rec_price = float(arms[arm] * max(rd["BASE_PRICE"], 1e-6))
+
+            # "realized" for offline eval: use historical sale price if present, else our rec
+            realized_price = float(rd["SALE_PRICE"]) if pd.notnull(rd["SALE_PRICE"]) and rd["SALE_PRICE"] > 0 else rec_price
+            realized_qty   = float(rd["SALE_QTY_TOTAL"]) if pd.notnull(rd["SALE_QTY_TOTAL"]) else 0.0
+
+            # log evaluation row
+            rolling_rows.append({
+                **{k: rd[k] for k in keys},
+                "RECOMMENDED_PRICE": rec_price,
+                "ARM": int(arm),
+                "REALIZED_PRICE": realized_price,
+                "REALIZED_QTY": realized_qty,
+                "BASE_PRICE": rd["BASE_PRICE"],
+                "DISCOUNT": rd.get("discount", 0.0),
             })
 
-    eval_results = pd.DataFrame(eval_results)
+            # update model with what actually happened this week
+            policy.update(rd, X, realized_price=realized_price, realized_qty=realized_qty)
 
-    # --- Final model: train on ALL history ---
-    model = LinUCB(nchoices=len(ARMS), alpha=1.0, fit_intercept=True, random_state=42)
-    for _, row in agg.iterrows():
-        X = build_features(row).reshape(1, -1)
-        a = BASELINE_ARM_IDX
-        r = row["SALE_QTY_TOTAL"]
-        model.fit(X, np.array([a]), np.array([r]))
+    rolling_eval_df = pd.DataFrame(rolling_rows)
 
-    # --- Predict next week ---
-    next_week = max_week + pd.Timedelta(weeks=1)
-    future = agg[agg["WEEK_START"] == max_week].copy()
-    future["WEEK_START"] = next_week
+    # ---------- slice last N weeks for reporting convenience ----------
+    if not rolling_eval_df.empty:
+        weeks_sorted = np.sort(rolling_eval_df["WEEK_START"].unique())
+        last_weeks = set(weeks_sorted[-min(report_last_weeks, len(weeks_sorted)):])
+        eval_lastN_df = rolling_eval_df[rolling_eval_df["WEEK_START"].isin(last_weeks)].copy()
+    else:
+        eval_lastN_df = rolling_eval_df.copy()
 
-    preds = []
-    for _, row in future.iterrows():
-        X = build_features(row).reshape(1, -1)
-        arm = model.predict(X)[0]
-        price = row["BASE_PRICE"] * ARMS[arm]
-        preds.append({
-            "STORE": row["STORE"],
-            "PRODUCT_CODE": row["PRODUCT_CODE"],
-            "WEEK_START": row["WEEK_START"],
-            "DAY_BUCKET": row["DAY_BUCKET"],
-            "RECOMM_PRICE": price,
-            "CHOSEN_ARM": arm,
-        })
-    next_week_results = pd.DataFrame(preds)
+    # ---------- predict NEXT WEEK (Mon after last history week) ----------
+    # last history week start:
+    if len(week_list) > 0:
+        last_week_start = pd.Timestamp(week_list.max())
+        next_week_start = last_week_start + pd.Timedelta(days=7)
+    else:
+        # if no data, default to Monday after HISTORY_END
+        last_week_start = (pd.Timestamp(HISTORY_END) - pd.to_timedelta(pd.Timestamp(HISTORY_END).weekday(), unit="D"))
+        next_week_start = last_week_start + pd.Timedelta(days=7)
 
-    return eval_results, next_week_results
+    base_next = agg[agg["WEEK_START"] == last_week_start].copy()
+    next_rows = []
+    if not base_next.empty:
+        for _, row in base_next.sort_values(["STORE","PRODUCT_CODE","DAY_BUCKET"]).iterrows():
+            rd = row.to_dict()
+            rd["WEEK_START"] = next_week_start
+            # update seasonal week number to next week
+            rd["week_of_year"] = int(next_week_start.isocalendar().week)
+            X = build_features(rd)
+            arm = policy.safe_choose(rd, X, fallback_arm=BASELINE_ARM_IDX)
+            rec_price = float(arms[arm] * max(rd["BASE_PRICE"], 1e-6))
+            next_rows.append({
+                "STORE": rd["STORE"],
+                "PRODUCT_CODE": rd["PRODUCT_CODE"],
+                "FAMILY_CODE": rd["FAMILY_CODE"],
+                "CATEGORY_CODE": rd["CATEGORY_CODE"],
+                "SEGMENT_CODE": rd["SEGMENT_CODE"],
+                "WEEK_START": next_week_start,
+                "DAY_BUCKET": rd["DAY_BUCKET"],
+                "RECOMMENDED_PRICE": rec_price,
+                "ARM": int(arm),
+                "BASE_PRICE": rd["BASE_PRICE"]
+            })
+    nextweek_df = pd.DataFrame(next_rows)
+
+    return rolling_eval_df, eval_lastN_df, nextweek_df
+
 
 
 
