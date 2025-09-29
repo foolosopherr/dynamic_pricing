@@ -46,65 +46,56 @@ def safe_div(a, b):
 # ----------------------------
 # 2) Aggregation to week × bucket
 # ----------------------------
-def make_week_bucket_panel(df: pd.DataFrame) -> pd.DataFrame:
+ddef make_week_bucket_panel(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    # Dates & buckets
     df["TRADE_DT"] = pd.to_datetime(df["TRADE_DT"])
     df["week_start"] = df["TRADE_DT"].apply(to_week_start)
     df["bucket"] = df["TRADE_DT"].dt.weekday.map(BUCKET_MAP)
 
-    # Demand (keep zeros if present rows)
+    # Cast numeric cols robustly
+    num_cols = ["SALE_QTY","SALE_QTY_ONLINE","SALE_PRICE","BASE_PRICE",
+                "START_STOCK","END_STOCK","DELIVERY_QTY","LOSS_QTY","RETURN_QTY"]
+    for c in num_cols:
+        if c in df:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
     df["SALE_QTY"] = df["SALE_QTY"].fillna(0)
     df["SALE_QTY_ONLINE"] = df["SALE_QTY_ONLINE"].fillna(0)
     df["q_total"] = df["SALE_QTY"] + df["SALE_QTY_ONLINE"]
 
-    # Prices
-    df["SALE_PRICE"] = df["SALE_PRICE"].astype(float)
-    df["BASE_PRICE"] = df["BASE_PRICE"].astype(float)
-
-    # Promo window parsed
     starts, ends = zip(*df["PROMO_PERIOD"].apply(parse_promo_period))
     df["promo_start"] = list(starts)
     df["promo_end"] = list(ends)
 
-    # Stock/flows (optional)
     for col in ["START_STOCK", "END_STOCK", "DELIVERY_QTY", "LOSS_QTY", "RETURN_QTY"]:
         if col in df:
             df[col] = df[col].fillna(0)
 
-    # Aggregate to week×bucket per STORE×PRODUCT
-    grp_cols = ["STORE", "PRODUCT_CODE", "bucket", "week_start",
-                "FAMILY_CODE", "CATEGORY_CODE", "SEGMENT_CODE",
-                "STORE_TYPE", "REGION_NAME", "PLACE_TYPE"]
+    grp_cols = ["STORE","PRODUCT_CODE","bucket","week_start",
+                "FAMILY_CODE","CATEGORY_CODE","SEGMENT_CODE",
+                "STORE_TYPE","REGION_NAME","PLACE_TYPE"]
 
-    agg = (df
-           .groupby(grp_cols, dropna=False)
-           .agg(
-                q_total=("q_total", "sum"),
-                price=("SALE_PRICE", "mean"),           # realized average price in that bucket
-                base_price=("BASE_PRICE", "mean"),
-                is_promo=("IS_PROMO", "max"),
-                start_stock=("START_STOCK", "sum"),
-                end_stock=("END_STOCK", "sum"),
-                delivery_qty=("DELIVERY_QTY", "sum"),
-                loss_qty=("LOSS_QTY", "sum"),
-                return_qty=("RETURN_QTY", "sum"),
-                promo_start=("promo_start", "min"),
-                promo_end=("promo_end", "max")
-            ).reset_index())
+    agg = (df.groupby(grp_cols, dropna=False)
+             .agg(q_total=("q_total","sum"),
+                  price=("SALE_PRICE","mean"),
+                  base_price=("BASE_PRICE","mean"),
+                  is_promo=("IS_PROMO","max"),
+                  start_stock=("START_STOCK","sum"),
+                  end_stock=("END_STOCK","sum"),
+                  delivery_qty=("DELIVERY_QTY","sum"),
+                  loss_qty=("LOSS_QTY","sum"),
+                  return_qty=("RETURN_QTY","sum"),
+                  promo_start=("promo_start","min"),
+                  promo_end=("promo_end","max"))
+             .reset_index())
 
-    # Ensure rows exist even with zero sales (already true if source had rows; if not, add completion as needed)
-
-    # Derived features (no leakage)
-    agg["promo_depth"] = safe_div(agg["base_price"] - agg["price"], agg["base_price"]).fillna(0)
-    agg["oos_flag"] = (agg["start_stock"] <= 0) | ((agg["start_stock"] + agg["delivery_qty"]
-                        - agg["end_stock"] - agg["loss_qty"] - agg["return_qty"]) <= 0)
-
-    # Future-aware but leak-safe promo indicator: promo window started by this week (we can know if already started)
+    agg["promo_depth"] = safe_div(agg["base_price"] - agg["price"], agg["base_price"]).fillna(0.0)
+    agg["oos_flag"] = (agg["start_stock"] <= 0) | \
+        ((agg["start_stock"] + agg["delivery_qty"] - agg["end_stock"] - agg["loss_qty"] - agg["return_qty"]) <= 0)
     agg["promo_active_now"] = (agg["promo_start"].notna()) & (agg["promo_start"] <= agg["week_start"]) & \
                               (agg["week_start"] <= agg["promo_end"].fillna(pd.Timestamp.max))
-
     return agg
+
 
 # ----------------------------
 # 3) Feature builder (lags & rollings)
@@ -129,38 +120,46 @@ def add_time_features(panel: pd.DataFrame, max_lag_weeks: int = 4) -> pd.DataFra
 # ----------------------------
 # 4) Hierarchical pooled model per bucket (ridge)
 # ----------------------------
-CAT_FEATS = ["STORE", "FAMILY_CODE", "CATEGORY_CODE", "SEGMENT_CODE",
-             "STORE_TYPE", "REGION_NAME", "PLACE_TYPE", "PRODUCT_CODE"]
-NUM_FEATS_BASE = ["price", "base_price", "promo_depth", "is_promo",
-                  "q_ma_4", "price_ma_4", "start_stock", "end_stock",
-                  "delivery_qty", "loss_qty", "return_qty", "oos_flag"] + \
-                 [f"q_lag_{i}" for i in range(1,5)] + [f"price_lag_{i}" for i in range(1,5)] + \
+from sklearn.preprocessing import OneHotEncoder, FunctionTransformer
+from sklearn.impute import SimpleImputer
+
+CAT_FEATS = ["STORE","FAMILY_CODE","CATEGORY_CODE","SEGMENT_CODE",
+             "STORE_TYPE","REGION_NAME","PLACE_TYPE","PRODUCT_CODE"]
+
+NUM_FEATS_BASE = ["price","base_price","promo_depth","is_promo",
+                  "q_ma_4","price_ma_4","start_stock","end_stock",
+                  "delivery_qty","loss_qty","return_qty","oos_flag"] + \
+                 [f"q_lag_{i}" for i in range(1,5)] + \
+                 [f"price_lag_{i}" for i in range(1,5)] + \
                  [f"promo_lag_{i}" for i in range(1,5)]
 
 def make_bucket_model(alpha: float = 5.0) -> Pipeline:
-    """
-    Ridge regression on log(1+q) with one-hot of hierarchy; ridge ~= partial pooling.
-    """
+    cat_pipe = Pipeline(steps=[
+        ("to_str", FunctionTransformer(lambda X: X.astype(str))),
+        ("ohe", OneHotEncoder(handle_unknown="ignore", min_frequency=5))
+    ])
+    num_pipe = Pipeline(steps=[
+        ("to_num", FunctionTransformer(lambda X: X.apply(pd.to_numeric, errors="coerce"))),
+        ("impute", SimpleImputer(strategy="constant", fill_value=0.0))
+    ])
     ct = ColumnTransformer(
         transformers=[
-            ("cat", OneHotEncoder(handle_unknown="ignore", min_frequency=5), CAT_FEATS),
-            ("num", "passthrough", NUM_FEATS_BASE),
-        ]
+            ("cat", cat_pipe, CAT_FEATS),
+            ("num", num_pipe, NUM_FEATS_BASE),
+        ],
+        sparse_threshold=0.3
     )
-    model = Pipeline(steps=[
-        ("prep", ct),
-        ("ridge", Ridge(alpha=alpha, fit_intercept=True, random_state=0))
-    ])
-    return model
+    return Pipeline(steps=[("prep", ct), ("ridge", Ridge(alpha=alpha, fit_intercept=True, random_state=0))])
+
 
 @dataclass
 class FittedBucket:
     model: Pipeline
     feature_cols: List[str]
 
-def fit_per_bucket_models(train_panel: pd.DataFrame, alpha: float = 5.0) -> Dict[str, FittedBucket]:
+def fit_per_bucket_models(train_panel: pd.DataFrame, alpha: float = 5.0):
     models = {}
-    for b in ["MonThu", "Fri", "SatSun"]:
+    for b in ["MonThu","Fri","SatSun"]:
         tr = train_panel[train_panel["bucket"] == b].copy()
         if tr.empty:
             continue
@@ -171,13 +170,14 @@ def fit_per_bucket_models(train_panel: pd.DataFrame, alpha: float = 5.0) -> Dict
         models[b] = FittedBucket(model=m, feature_cols=X_cols)
     return models
 
-def predict_qty(models: Dict[str, FittedBucket], df_rows: pd.DataFrame) -> np.ndarray:
+def predict_qty(models, df_rows):
     b = df_rows["bucket"].iloc[0]
-    fb = models.get(b, None)
+    fb = models.get(b)
     if fb is None:
         return np.zeros(len(df_rows))
     yhat = fb.model.predict(df_rows[fb.feature_cols])
     return np.expm1(yhat).clip(min=0)
+
 
 # ----------------------------
 # 5) Price ladder & optimizer
