@@ -307,18 +307,15 @@ class HierLinUCB:
 # ---------------- training & prediction ----------------
 def train_and_eval(df_daily, horizon_weeks=12):
     """
-    Rolling evaluation using the same training/prediction code as in your snippet.
-    For each of the last horizon_weeks:
-      - Train on all weeks before t
-      - Predict for week t
-    Then retrain on all history and predict for next week.
+    Rolling evaluation with bandit updates.
+    - For each of the last horizon_weeks: train on all previous weeks (row by row update),
+      then predict for that week.
+    - Finally: retrain on all history and predict next week.
     """
-
-    # --- Prepare and feature engineering ---
     df = prepare(df_daily)
     df = add_features(df)
 
-    # aggregate features per product/store/week/bucket
+    # --- aggregate data ---
     agg = df.groupby(
         ["STORE","PRODUCT_CODE","FAMILY_CODE","CATEGORY_CODE","SEGMENT_CODE","WEEK_START","DAY_BUCKET"],
         as_index=False
@@ -346,24 +343,24 @@ def train_and_eval(df_daily, horizon_weeks=12):
         if week < eval_start:
             continue
 
-        # split
         train_df = agg[agg["WEEK_START"] < week]
-        eval_df  = agg[agg["WEEK_START"] == week]
-        if train_df.empty or eval_df.empty:
+        test_df  = agg[agg["WEEK_START"] == week]
+
+        if train_df.empty or test_df.empty:
             continue
 
-        # --- Train model ---
-        model = LinUCB(nchoices=len(ARMS), alpha=1.0,
-                       fit_intercept=True, random_state=42)
+        # init fresh bandit
+        model = LinUCB(nchoices=len(ARMS), alpha=1.0, fit_intercept=True, random_state=42)
 
+        # === reuse your code for training (row-by-row update) ===
         for _, row in train_df.iterrows():
             X = build_features(row).reshape(1, -1)
             a = BASELINE_ARM_IDX
             r = row["SALE_QTY_TOTAL"]
             model.fit(X, np.array([a]), np.array([r]))
 
-        # --- Evaluate for this week ---
-        for _, row in eval_df.iterrows():
+        # === reuse your code for evaluation (predict current week) ===
+        for _, row in test_df.iterrows():
             X = build_features(row).reshape(1, -1)
             arm = model.predict(X)[0]
             price = row["BASE_PRICE"] * ARMS[arm]
@@ -380,17 +377,15 @@ def train_and_eval(df_daily, horizon_weeks=12):
 
     eval_results = pd.DataFrame(eval_results)
 
-    # --- Train on ALL history for next-week prediction ---
-    model = LinUCB(nchoices=len(ARMS), alpha=1.0,
-                   fit_intercept=True, random_state=42)
-
+    # --- Final model: train on ALL history ---
+    model = LinUCB(nchoices=len(ARMS), alpha=1.0, fit_intercept=True, random_state=42)
     for _, row in agg.iterrows():
         X = build_features(row).reshape(1, -1)
         a = BASELINE_ARM_IDX
         r = row["SALE_QTY_TOTAL"]
         model.fit(X, np.array([a]), np.array([r]))
 
-    # --- Predict for next week ---
+    # --- Predict next week ---
     next_week = max_week + pd.Timedelta(weeks=1)
     future = agg[agg["WEEK_START"] == max_week].copy()
     future["WEEK_START"] = next_week
@@ -408,10 +403,10 @@ def train_and_eval(df_daily, horizon_weeks=12):
             "RECOMM_PRICE": price,
             "CHOSEN_ARM": arm,
         })
-
     next_week_results = pd.DataFrame(preds)
 
     return eval_results, next_week_results
+
 
 
 eval_df, nextweek_df = train_and_eval(df_daily)
