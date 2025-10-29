@@ -46,6 +46,28 @@ EXPLORATION_EPS = 0.05     # базовая эпсилон-исследован�
 # Срез истории: конец истории (не обучаемся/смотрим дальше)
 END_OF_HISTORY = pd.Timestamp("2025-09-15")
 
+# --- Add these helpers near ARM_GRID ---
+
+def price_to_multiplier(price, base_price):
+    # аккуратно обрабатываем нули/NaN
+    if pd.isna(price) or pd.isna(base_price) or base_price <= 0:
+        return np.nan
+    m = np.round(price / base_price, 2)
+    # снап к ARM_GRID, чтобы индекс совпадал с глобальной сеткой
+    idx = np.argmin(np.abs(ARM_GRID - m))
+    return ARM_GRID[idx]
+
+def action_vector_from_price(price, base_price):
+    # one-hot длиной len(ARM_GRID) по глобальному индексу мультипликатора
+    vec = np.zeros(len(ARM_GRID), dtype=float)
+    m = price_to_multiplier(price, base_price)
+    if pd.isna(m):
+        return vec
+    idx = int(np.where(np.isclose(ARM_GRID, m))[0][0])
+    vec[idx] = 1.0
+    return vec
+
+
 
 # ==================================
 # 1) Утилиты для дат и PROMO_PERIOD
@@ -337,32 +359,31 @@ def predict_demand(pipe, Xcand):
 # =========================================
 
 class LinUCB:
-    """
-    Простой LinUCB с шарингом параметров по ключу группы (иерархия).
-    Каждая группа — своя матрица A и вектор b.
-    Контекст строится из фич и one-hot для действия (мультипликатора).
-    """
     def __init__(self, alpha=1.0):
         self.alpha = alpha
-        self.groups = {}  # group_id -> {"A":, "b":}
+        self.groups = {}  # gid -> {"A":, "b":, "dim": int}
 
-    def _init_group(self, gid, dim):
+    def _init_or_reset_group(self, gid, dim):
+        self.groups[gid] = {
+            "A": np.eye(dim),
+            "b": np.zeros(dim),
+            "dim": dim
+        }
+
+    def _ensure_group_dim(self, gid, dim):
         if gid not in self.groups:
-            self.groups[gid] = {
-                "A": np.eye(dim),
-                "b": np.zeros(dim)
-            }
+            self._init_or_reset_group(gid, dim)
+        elif self.groups[gid]["dim"] != dim:
+            # безопасность: если вдруг размер изменился — переинициализируем
+            self._init_or_reset_group(gid, dim)
 
     def select(self, gid, ctx_matrix, actions_matrix):
-        """
-        ctx_matrix: (n_actions, d_ctx)
-        actions_matrix: (n_actions, d_act) — one-hot действие или преобраз. признаков действия
-        Итоговый x = concat(ctx, action_feats).
-        Возвращает индекс выбранного действия по UCB.
-        """
+        # ctx_matrix: (n_actions, d_ctx)
+        # actions_matrix: (n_actions, d_action)  # здесь d_action = len(ARM_GRID) – фиксированный
         n = ctx_matrix.shape[0]
         d = ctx_matrix.shape[1] + actions_matrix.shape[1]
-        self._init_group(gid, d)
+        self._ensure_group_dim(gid, d)
+
         A = self.groups[gid]["A"]
         b = self.groups[gid]["b"]
         A_inv = np.linalg.inv(A)
@@ -373,16 +394,12 @@ class LinUCB:
             theta = A_inv.dot(b)
             mu = theta.dot(x)
             sigma = np.sqrt(x.dot(A_inv).dot(x))
-            ucb = mu + self.alpha * sigma
-            scores.append(ucb)
+            scores.append(mu + self.alpha * sigma)
         return int(np.argmax(scores))
 
     def update(self, gid, x, reward):
-        """
-        Обновление параметров по выбранному x и наблюдённому вознаграждению.
-        """
         d = x.shape[0]
-        self._init_group(gid, d)
+        self._ensure_group_dim(gid, d)
         A = self.groups[gid]["A"]
         b = self.groups[gid]["b"]
         A += np.outer(x, x)
@@ -409,42 +426,34 @@ def expected_profit(demand, price, cost_price):
     return np.maximum(0.0, price - cost) * np.maximum(0.0, demand)
 
 
+ # 3) Полный код функции выбора цены с фиксированным action-вектором (глобальный one-hot по ARM_GRID)
+
 def choose_price_for_row(row, pipe, bandit, last_price, group_id):
-    """
-    Для одной строки (STORE×PRODUCT×WEEK×BUCKET):
-    - генерируем кандидаты цен
-    - считаем контекст
-    - получаем прогноз спроса
-    - применяем LinUCB, учитывая небольшой эпсилон-эксплорейшн
-    - возвращаем выбранную цену и служебную информацию
-    """
+    # Кандидаты с учётом прайс-лестницы и ограничения шага
     base_price = row["BASE_PRICE"]
     candidates = generate_candidates(base_price, last_price)
     if len(candidates) == 0:
         return np.nan, {"reason": "no_candidates"}
 
-    # Формируем матрицу кандидатов для прогноза спроса
+    # Прогноз спроса на кандидатов
     Xcand = pd.DataFrame([row] * len(candidates)).reset_index(drop=True)
     Xcand["SALE_PRICE"] = candidates
     demand_pred = predict_demand(pipe, Xcand)
 
-    # Риск OOS -> штраф к ожидаемой прибыли
+    # Оценка ожидаемой прибыли с учётом штрафа за риск OOS
     risk = float(row.get("RISK_OOS", 0.0))
     profits = []
     for q, p in zip(demand_pred, candidates):
         prof = expected_profit(q, p, row.get("BASE_PRICE", p)) * (1.0 - OOS_PENALTY * risk)
         profits.append(prof)
-
     profits = np.array(profits)
 
-    # Эпсилон-рандом для исследования
+    # ε-исследование
     if np.random.rand() < EXPLORATION_EPS:
         idx = np.random.randint(len(candidates))
-        chosen = candidates[idx]
-        return chosen, {"reason": "epsilon_explore", "profit_est": float(profits[idx])}
+        return float(candidates[idx]), {"reason": "epsilon_explore", "profit_est": float(profits[idx])}
 
-    # Строим контекст для LinUCB:
-    # ctx = подмножество фич (числовые), action_feats = one-hot по индексу кандидата
+    # Контекст (фиксированная числовая часть)
     ctx_cols = [
         "IS_PROMO_NOW", "ONLINE_SHARE", "VOLATILITY_QTY_4W",
         "FAM_SALE_QTY", "CAT_SALE_QTY", "SEG_SALE_QTY", "REG_SALE_QTY", "STT_SALE_QTY",
@@ -452,10 +461,14 @@ def choose_price_for_row(row, pipe, bandit, last_price, group_id):
     ]
     ctx = np.array([row.get(c, 0.0) for c in ctx_cols], dtype=float)
     ctx_matrix = np.vstack([ctx] * len(candidates))
-    action_matrix = np.eye(len(candidates))
-    # Выбор по UCB (используем ожидаемую прибыль как прокси-вознаграждение)
+
+    # Фиксированная action-матрица: one-hot длиной len(ARM_GRID) по глобальному мультипликатору
+    action_matrix = np.vstack([action_vector_from_price(p, base_price) for p in candidates])
+
+    # Выбор действия LinUCB (фиксированное измерение признаков)
     idx = bandit.select(group_id, ctx_matrix, action_matrix)
-    chosen = candidates[idx]
+    chosen = float(candidates[idx])
+
     return chosen, {
         "reason": "linucb",
         "profit_est": float(profits[idx]),
@@ -463,34 +476,29 @@ def choose_price_for_row(row, pipe, bandit, last_price, group_id):
     }
 
 
+
 # ==================================
 # 8) Тренировка, оценка, предсказание
 # ==================================
 
+# 4) Полный код walk_forward_eval с обновлением бандита через фиксированный action-вектор
+
 def walk_forward_eval(weekly_df, weeks_sorted, horizon_eval=12):
-    """
-    Оценка в формате walk-forward:
-    на каждом шаге берём последние 12 недель как тренинг, предсказываем текущую неделю по 3 бакетам.
-    Возвращает таблицу с выбранными ценами и фактическими метриками.
-    """
     pipe, _ = build_demand_model()
     bandit = LinUCB(alpha=1.0)
 
     results = []
-
-    # Храним последнюю цену на SKU×STORE×BUCKET для ограничения шага
     last_prices = {}
 
     for i in range(horizon_eval, len(weeks_sorted)):
         train_weeks = weeks_sorted[i - horizon_eval: i]
         pred_week = weeks_sorted[i]
 
-        # Тренингная выборка: только train_weeks
+        # Обучение модели спроса
         train_data = weekly_df[weekly_df["WEEK_ID"].isin(train_weeks)].copy()
-        # Обучение модели спроса (подбор простой; можно ускорять partial_fit/инкрементально)
         pipe = fit_demand_model(pipe, train_data)
 
-        # Предсказание/выбор цен по 3 бакетам в неделе pred_week
+        # Предсказание/выбор цен на неделю pred_week (3 бакета)
         pred_rows = weekly_df[weekly_df["WEEK_ID"] == pred_week].copy()
         pred_rows = pred_rows.sort_values(["STORE", "PRODUCT_CODE", "BUCKET"])
 
@@ -499,23 +507,18 @@ def walk_forward_eval(weekly_df, weeks_sorted, horizon_eval=12):
         for _, row in pred_rows.iterrows():
             key_lp = (row["STORE"], row["PRODUCT_CODE"], row["BUCKET"])
             last_price = last_prices.get(key_lp, row["BASE_PRICE"])
-            # Иерархический group_id для шаринга параметров (STORE×SEGMENT×BUCKET)
             group_id = f"{row['STORE']}|{row['SEGMENT_CODE']}|{row['BUCKET']}"
 
             chosen_price, info = choose_price_for_row(row, pipe, bandit, last_price, group_id)
 
-            # Обновляем last_prices на следующую неделю (симуляция: используем выбранную)
             if not pd.isna(chosen_price):
                 last_prices[key_lp] = chosen_price
 
-            # Симулируем reward: возьмём фактические продажи и цену текущей истории (как if «фикс») — 
-            # в проде вместо этого будет фактический результат; здесь же можно использовать
-            # proxy-reward = оценка прибыли от модели спроса (profits[idx]).
-            # Для обучения бандита возьмем нормированную прибыль: profit / (1 + |profit|)
+            # Псевдо-награда по оценке прибыли (в проде сюда идут факты)
             profit_hat = info.get("profit_est", 0.0)
             reward = profit_hat / (1.0 + abs(profit_hat))
 
-            # Построим вектор признаков x для апдейта бандита (должен совпасть с select)
+            # Контекстная часть для обновления
             ctx_cols = [
                 "IS_PROMO_NOW", "ONLINE_SHARE", "VOLATILITY_QTY_4W",
                 "FAM_SALE_QTY", "CAT_SALE_QTY", "SEG_SALE_QTY", "REG_SALE_QTY", "STT_SALE_QTY",
@@ -523,17 +526,8 @@ def walk_forward_eval(weekly_df, weeks_sorted, horizon_eval=12):
             ]
             ctx = np.array([row.get(c, 0.0) for c in ctx_cols], dtype=float)
 
-            # Восстановим список кандидатов, чтобы собрать правильный one-hot
-            cands = generate_candidates(row["BASE_PRICE"], last_price)
-            if len(cands) == 0:
-                continue
-            action_idx = None
-            # Нужен индекс выбранной цены в массиве cands
-            try:
-                action_idx = int(np.where(np.isclose(cands, chosen_price))[0][0])
-            except:
-                action_idx = 0
-            act = np.eye(len(cands))[action_idx]
+            # Фиксированный action-вектор на основе выбранной цены
+            act = action_vector_from_price(chosen_price, row["BASE_PRICE"])
             x = np.concatenate([ctx, act])
             bandit.update(group_id, x, reward)
 
@@ -554,53 +548,63 @@ def walk_forward_eval(weekly_df, weeks_sorted, horizon_eval=12):
     return pd.concat(results, ignore_index=True)
 
 
+
+# 5) Исправленный predict_next_week_prices с фиксированным action-вектором (глобальный one-hot по ARM_GRID)
+
 def predict_next_week_prices(weekly_df, next_week_id):
-    """
-    Боевой запуск для недели next_week_id:
-    - тренируемся на последние 12 недель до неё
-    - выбираем цены по 3 бакетам
-    """
+    # Проверяем наличие недели и достаточной истории (≥12 недель до неё)
     all_weeks = sorted(weekly_df["WEEK_ID"].unique())
     if next_week_id not in all_weeks:
-        raise ValueError("next_week_id отсутствует в данных weekly_df (нужен пустой шаблон строк на неделю).")
-
+        raise ValueError("next_week_id отсутствует в weekly_df (нужен шаблон строк на эту неделю).")
     idx = all_weeks.index(next_week_id)
     if idx < 12:
         raise ValueError("Недостаточно истории (<12 недель) для обучения.")
 
+    # Тренируем модель спроса на последних 12 неделях до целевой
     train_weeks = all_weeks[idx - 12: idx]
     pipe, _ = build_demand_model()
     bandit = LinUCB(alpha=1.0)
-    last_prices = {}
 
     train_data = weekly_df[weekly_df["WEEK_ID"].isin(train_weeks)].copy()
     pipe = fit_demand_model(pipe, train_data)
 
+    # Для ограничения шага цены используем цену предыдущей недели по тому же бакету
+    prev_week_id = all_weeks[idx - 1]
+    prev_df = weekly_df[weekly_df["WEEK_ID"] == prev_week_id][
+        ["STORE", "PRODUCT_CODE", "BUCKET", "SALE_PRICE", "BASE_PRICE"]
+    ].copy()
+    prev_df = prev_df.rename(columns={"SALE_PRICE": "LAST_SALE_PRICE"})
+    prev_key = list(zip(prev_df["STORE"], prev_df["PRODUCT_CODE"], prev_df["BUCKET"]))
+    prev_map = {k: p for k, p in zip(prev_key, prev_df["LAST_SALE_PRICE"])}
+
+    # Ряды для предсказания на целевую неделю
     pred_rows = weekly_df[weekly_df["WEEK_ID"] == next_week_id].copy()
     pred_rows = pred_rows.sort_values(["STORE", "PRODUCT_CODE", "BUCKET"])
 
-    chosen = []
+    recommendations = []
 
     for _, row in pred_rows.iterrows():
         key_lp = (row["STORE"], row["PRODUCT_CODE"], row["BUCKET"])
-        last_price = last_prices.get(key_lp, row["BASE_PRICE"])
+        last_price = prev_map.get(key_lp, row["BASE_PRICE"])
         group_id = f"{row['STORE']}|{row['SEGMENT_CODE']}|{row['BUCKET']}"
 
+        # Выбор цены с учётом фиксированного action-вектора в choose_price_for_row
         price, info = choose_price_for_row(row, pipe, bandit, last_price, group_id)
-        chosen.append({
+
+        recommendations.append({
             "STORE": row["STORE"],
             "PRODUCT_CODE": row["PRODUCT_CODE"],
             "BUCKET": row["BUCKET"],
             "WEEK_ID": next_week_id,
             "RECOMMENDED_PRICE": price,
             "BASE_PRICE": row["BASE_PRICE"],
+            "LAST_PRICE_PREV_WEEK": last_price,
             "REASON": info.get("reason", "na"),
             "PROFIT_EST": info.get("profit_est", np.nan)
         })
-        if not pd.isna(price):
-            last_prices[key_lp] = price
 
-    return pd.DataFrame(chosen)
+    return pd.DataFrame(recommendations)
+
 
 
 # ==========================================
