@@ -76,6 +76,49 @@ def parse_promo_period(s):
         return start, end
     except:
         return None, None
+    
+# ---- Week helpers (put near other date utils) ----
+
+def monday_from_week_id(next_week_id):
+    # Accepts 'YYYY-Www' or a date-like string; returns Monday Timestamp.
+    try:
+        if "W" in next_week_id:
+            y, w = next_week_id.split("-W")
+            y = int(y); w = int(w)
+            # ISO week: Monday is the first day
+            return pd.Timestamp.fromisocalendar(y, w, 1).normalize()
+        # else treat as date
+        return week_start_monday(pd.Timestamp(next_week_id))
+    except Exception:
+        # fallback: try parse as date anyway
+        return week_start_monday(pd.Timestamp(next_week_id))
+    
+
+def ensure_future_week_in_weekly_df(raw_df, weekly_df, next_week_id):
+    """
+    If weekly_df has no rows for next_week_id, create a future-week template
+    from raw_df (Mon..Sun, 3 buckets) and rebuild weekly_df so lags/hierarchy exist.
+    """
+    # already present?
+    if (weekly_df["WEEK_ID"] == next_week_id).any():
+        return weekly_df
+
+    # Build template rows for that week
+    monday = monday_from_week_id(next_week_id)
+    fut = create_future_week_template(raw_df, monday)
+    if fut.empty:
+        # Nothing to add — keep as-is; caller will still error out
+        return weekly_df
+
+    # Merge with history and recompute features
+    df_hist = prepare_raw(raw_df)
+    # put a TRADE_DT for future rows (monday) so prepare_raw sets WEEK_ID/BUCKET
+    fut = fut.assign(TRADE_DT=monday)
+    combined = pd.concat([df_hist, fut], ignore_index=True, sort=False)
+    combined = prepare_raw(combined)  # re-derive WEEK_ID/BUCKET/etc.
+    weekly = weekly_aggregates(combined)
+    return weekly
+
 
 
 # ==================================
@@ -526,14 +569,23 @@ def walk_forward_eval(weekly_df, weeks_sorted, horizon_eval=12):
     return pd.concat(results, ignore_index=True)
 
 
-def predict_next_week_prices(weekly_df, next_week_id):
+# ---- Drop-in replacement for predict_next_week_prices ----
+
+def predict_next_week_prices(weekly_df, next_week_id, raw_df=None):
+    # If raw_df is provided and the target week is absent, create it on the fly
+    if (weekly_df["WEEK_ID"] == next_week_id).sum() == 0:
+        if raw_df is None:
+            raise ValueError("next_week_id отсутствует в weekly_df (передайте raw_df или сначала создайте шаблон строк на неделю).")
+        weekly_df = ensure_future_week_in_weekly_df(raw_df, weekly_df, next_week_id)
+        if (weekly_df["WEEK_ID"] == next_week_id).sum() == 0:
+            raise ValueError("Не удалось создать шаблон строк на неделю (нет истории для базовых цен).")
+
     all_weeks = sorted(weekly_df["WEEK_ID"].unique())
-    if next_week_id not in all_weeks:
-        raise ValueError("next_week_id отсутствует в weekly_df (нужен шаблон строк на эту неделю).")
     idx = all_weeks.index(next_week_id)
     if idx < 12:
         raise ValueError("Недостаточно истории (<12 недель) для обучения.")
 
+    # Train demand model on last 12 weeks prior to target
     train_weeks = all_weeks[idx - 12: idx]
     pipe, _ = build_demand_model()
     bandit = LinUCB(alpha=1.0)
@@ -541,6 +593,7 @@ def predict_next_week_prices(weekly_df, next_week_id):
     train_data = weekly_df[weekly_df["WEEK_ID"].isin(train_weeks)].copy()
     pipe = fit_demand_model(pipe, train_data)
 
+    # Previous-week prices map (same bucket)
     prev_week_id = all_weeks[idx - 1]
     prev_df = weekly_df[weekly_df["WEEK_ID"] == prev_week_id][
         ["STORE", "PRODUCT_CODE", "BUCKET", "SALE_PRICE", "BASE_PRICE"]
@@ -549,6 +602,7 @@ def predict_next_week_prices(weekly_df, next_week_id):
     prev_key = list(zip(prev_df["STORE"], prev_df["PRODUCT_CODE"], prev_df["BUCKET"]))
     prev_map = {k: p for k, p in zip(prev_key, prev_df["LAST_SALE_PRICE"])}
 
+    # Target rows
     pred_rows = weekly_df[weekly_df["WEEK_ID"] == next_week_id].copy()
     pred_rows = pred_rows.sort_values(["STORE", "PRODUCT_CODE", "BUCKET"])
 
@@ -571,6 +625,7 @@ def predict_next_week_prices(weekly_df, next_week_id):
         })
 
     return pd.DataFrame(recommendations)
+
 
 
 # ============================================
@@ -606,14 +661,12 @@ def bucket_for_run_date(run_date):
     raise ValueError("Код должен запускаться только в понедельник, пятницу или субботу.")
 
 def recommend_for_run_date(raw_df, run_date):
-    # 1) weekly_df (история + будущая неделя)
     weekly_df = build_weekly_df_with_future(raw_df, run_date)
     target_week = week_id(week_start_monday(pd.Timestamp(run_date)))
-    # 2) Получаем рекомендации на всю неделю
-    full_week_reco = predict_next_week_prices(weekly_df, target_week)
-    # 3) Оставляем только нужный бакет ( Mon->Mon-Thu, Fri->Fri, Sat->Sat-Sun )
+    full_week_reco = predict_next_week_prices(weekly_df, target_week, raw_df=raw_df)
     target_bucket = bucket_for_run_date(run_date)
     return weekly_df, full_week_reco[full_week_reco["BUCKET"] == target_bucket].reset_index(drop=True)
+
 
 
 # ============================================
