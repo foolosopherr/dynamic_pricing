@@ -204,13 +204,7 @@ def select_arm(row, last_price, last_arm, model, cat_cols, num_cols):
 # Rolling evaluation (12 weeks)
 # ----------------------------
 def rolling_eval(agg, bucket_kind, end_bucket_start, weeks=12):
-    """
-    Evaluate for last `weeks` occurrences of `bucket_kind` with end strictly before `end_bucket_start`.
-    For each evaluation bucket, the demand model is trained on **all buckets** with BUCKET_START < target_start.
-    """
     out = []
-
-    # buckets of this kind before end_bucket_start
     to_eval = (agg.query("BUCKET_KIND == @bucket_kind and BUCKET_START < @end_bucket_start")
                  .drop_duplicates(subset=["WEEK_START","BUCKET_KIND"])
                  .sort_values("BUCKET_START"))[-weeks:]
@@ -218,33 +212,31 @@ def rolling_eval(agg, bucket_kind, end_bucket_start, weeks=12):
     for _, r in to_eval.iterrows():
         target_start = r["BUCKET_START"]
 
-        # TRAIN = all buckets strictly before target_start
         train_hist = agg[agg["BUCKET_START"] < target_start]
         if len(train_hist) < 50:
             continue
 
         model, cat_cols, num_cols = train_demand_model(train_hist)
 
-        cur = agg[(agg["BUCKET_KIND"] == bucket_kind) & (agg["BUCKET_START"] == target_start)].copy()
+        cur = build_bucket_snapshot(agg, bucket_kind, target_start).copy()
+        if cur.empty:
+            continue
 
-        # last realized price from ANY previous bucket
-        prev = agg[agg["BUCKET_START"] < target_start].sort_values("BUCKET_START")
-        prev_last = (prev.groupby(["STORE","PRODUCT_CODE"]).tail(1)[["STORE","PRODUCT_CODE","PRICE"]]
-                         .rename(columns={"PRICE":"LAST_PRICE"}))
-        cur = cur.merge(prev_last, on=["STORE","PRODUCT_CODE"], how="left")
-        cur["LAST_ARM"] = (cur["LAST_PRICE"] / cur["BASE_PRICE"]).round(2)
+        cur["LAST_ARM"] = (cur.get("LAST_PRICE", np.nan) / cur["BASE_PRICE"]).round(2)
 
         recs = []
         for _, row in cur.iterrows():
             arm, price, prof = select_arm(row, row.get("LAST_PRICE", np.nan), row.get("LAST_ARM", np.nan),
                                           model, cat_cols, num_cols)
             recs.append((arm, price, prof))
+        if len(recs) == 0:
+            continue
+
         cur["REC_ARM"], cur["REC_PRICE"], cur["REC_PROFIT_SIM"] = zip(*recs)
 
-        # Baseline: keep last price (or base)
-        cur["BASELINE_PRICE"] = np.where(cur["LAST_PRICE"].notna(), cur["LAST_PRICE"], cur["BASE_PRICE"])
-        baseX = cur.copy()
-        baseX["PRICE"] = baseX["BASELINE_PRICE"]
+        # baseline
+        cur["BASELINE_PRICE"] = np.where(cur.get("LAST_PRICE").notna(), cur["LAST_PRICE"], cur["BASE_PRICE"])
+        baseX = cur.copy(); baseX["PRICE"] = baseX["BASELINE_PRICE"]
         base_qty = predict_qty(model, cat_cols, num_cols, baseX)
         base_served = np.minimum(base_qty, np.maximum(cur["AVAIL_STOCK"],0))
         cur["BASELINE_PROFIT_SIM"] = (baseX["PRICE"] - baseX["COST_PRICE"]) * base_served
@@ -269,36 +261,97 @@ def rolling_eval(agg, bucket_kind, end_bucket_start, weeks=12):
 # ----------------------------
 # One-shot recommendation for a chosen bucket (using info strictly before bucket start)
 # ----------------------------
-def recommend_for_bucket(agg, bucket_kind, bucket_start):
-    # Train model on ALL buckets strictly before this bucket start
-    train_hist = agg[agg["BUCKET_START"] < bucket_start]
-    if len(train_hist) < 50:
-        raise ValueError("Not enough history for training. Provide more data or relax filters.")
-    model, cat_cols, num_cols = train_demand_model(train_hist)
-
+def build_bucket_snapshot(agg, bucket_kind, bucket_start):
+    """
+    Returns a frame for (STORE, PRODUCT_CODE) active before bucket_start.
+    Prefers actual agg rows for this bucket; otherwise fills from last-seen history.
+    """
+    week_start = week_monday(bucket_start)
+    # actual rows for this bucket (if any)
     cur = agg[(agg["BUCKET_KIND"] == bucket_kind) & (agg["BUCKET_START"] == bucket_start)].copy()
 
-    # last realized price from ANY earlier bucket
-    prev = agg[agg["BUCKET_START"] < bucket_start].sort_values("BUCKET_START")
-    prev_last = (prev.groupby(["STORE","PRODUCT_CODE"]).tail(1)[["STORE","PRODUCT_CODE","PRICE"]]
-                     .rename(columns={"PRICE":"LAST_PRICE"}))
-    cur = cur.merge(prev_last, on=["STORE","PRODUCT_CODE"], how="left")
-    cur["LAST_ARM"] = (cur["LAST_PRICE"] / cur["BASE_PRICE"]).round(2)
+    # keys active before target
+    hist = agg[agg["BUCKET_START"] < bucket_start]
+    if hist.empty:
+        return cur  # nothing we can infer
+
+    last = (hist.sort_values("BUCKET_START")
+                 .groupby(["STORE","PRODUCT_CODE"]).tail(1)
+                 .copy())
+
+    # minimal skeleton
+    skel = last[["STORE","PRODUCT_CODE"]].drop_duplicates().copy()
+    skel["WEEK_START"]   = week_start
+    skel["BUCKET_START"] = bucket_start
+    skel["BUCKET_KIND"]  = bucket_kind
+
+    # bring last-known numeric fields
+    keep_cols = ["BASE_PRICE","COST_PRICE","PRICE","AVAIL_STOCK","START_STOCK",
+                 "END_STOCK","DELIVERY_QTY","QTY","FAMILY_CODE","CATEGORY_CODE","SEGMENT_CODE"]
+    for c in keep_cols:
+        if c in last.columns:
+            skel = skel.merge(last[["STORE","PRODUCT_CODE",c]], on=["STORE","PRODUCT_CODE"], how="left")
+
+    # rename last PRICE to LAST_PRICE; ensure BASE/COST exist
+    if "PRICE" in skel.columns:
+        skel.rename(columns={"PRICE":"LAST_PRICE"}, inplace=True)
+    if "BASE_PRICE" not in skel.columns: skel["BASE_PRICE"] = np.nan
+    if "COST_PRICE" not in skel.columns: skel["COST_PRICE"] = np.nan
+
+    # prefer actual rows if they exist; combine
+    if not cur.empty:
+        # attach LAST_PRICE to current via last
+        cur = cur.merge(skel[["STORE","PRODUCT_CODE","LAST_PRICE"]], on=["STORE","PRODUCT_CODE"], how="left")
+        snap = cur
+    else:
+        # when no actual rows: create pseudo-agg row for the bucket
+        snap = skel.copy()
+        snap["QTY"] = 0.0
+        # AVAIL_STOCK fallback if missing
+        if "AVAIL_STOCK" not in snap.columns or snap["AVAIL_STOCK"].isna().all():
+            snap["AVAIL_STOCK"] = np.maximum(snap.get("START_STOCK", 0).fillna(0)
+                                             + snap.get("DELIVERY_QTY", 0).fillna(0)
+                                             - snap.get("QTY", 0).fillna(0), 0)
+    return snap
+
+
+def recommend_for_bucket(agg, bucket_kind, bucket_start):
+    train_hist = agg[agg["BUCKET_START"] < bucket_start]
+    if len(train_hist) < 50:
+        raise ValueError("Not enough history for training before this bucket_start.")
+
+    model, cat_cols, num_cols = train_demand_model(train_hist)
+
+    cur = build_bucket_snapshot(agg, bucket_kind, bucket_start).copy()
+    if cur.empty:
+        return cur  # nothing to recommend
+
+    # LAST_ARM from LAST_PRICE if present
+    cur["LAST_ARM"] = (cur.get("LAST_PRICE", np.nan) / cur["BASE_PRICE"]).round(2)
 
     recs = []
     for _, row in cur.iterrows():
         arm, price, prof = select_arm(row, row.get("LAST_PRICE", np.nan), row.get("LAST_ARM", np.nan),
                                       model, cat_cols, num_cols)
         recs.append((arm, price, prof))
-    cur["REC_ARM"], cur["REC_PRICE"], cur["REC_PROFIT_SIM"] = zip(*recs)
 
+    if len(recs) == 0:
+        # return structure with NaNs instead of throwing
+        cur["REC_ARM"] = np.nan
+        cur["REC_PRICE"] = np.nan
+        cur["REC_PROFIT_SIM"] = np.nan
+        return cur[["STORE","PRODUCT_CODE","BUCKET_KIND","WEEK_START","BUCKET_START",
+                    "BASE_PRICE","LAST_PRICE","REC_ARM","REC_PRICE","REC_PROFIT_SIM"]]
+
+    cur["REC_ARM"], cur["REC_PRICE"], cur["REC_PROFIT_SIM"] = zip(*recs)
     return cur[["STORE","PRODUCT_CODE","BUCKET_KIND","WEEK_START","BUCKET_START",
                 "BASE_PRICE","LAST_PRICE","REC_ARM","REC_PRICE","REC_PROFIT_SIM"]]
+
 
 # ----------------------------
 # Orchestration: run for 3 buckets & evaluate
 # ----------------------------
-ddef run_for_run_date(df, run_date_str):
+def run_for_run_date(df, run_date_str):
     """
     Run the pipeline for a specific calendar date that is guaranteed to be Mon, Fri or Sat.
     Uses ALL history strictly before the start of that bucket (so Fri sees Mon–Thu; Sat–Sun sees Fri).
