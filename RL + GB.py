@@ -358,55 +358,66 @@ def predict_demand(pipe, Xcand):
 # 6) Контекстуальный бандит (LinUCB / TS)
 # =========================================
 
+def _pad_or_trim(vec, target_dim):
+    d = vec.shape[0]
+    if d == target_dim: return vec
+    if d < target_dim:
+        out = np.zeros(target_dim, dtype=float); out[:d] = vec; return out
+    return vec[:target_dim]
+
 class LinUCB:
     def __init__(self, alpha=1.0):
         self.alpha = alpha
         self.groups = {}  # gid -> {"A":, "b":, "dim": int}
 
-    def _init_or_reset_group(self, gid, dim):
-        self.groups[gid] = {
-            "A": np.eye(dim),
-            "b": np.zeros(dim),
-            "dim": dim
-        }
+    def _init_group(self, dim):
+        return {"A": np.eye(dim, dtype=float), "b": np.zeros(dim, dtype=float), "dim": dim}
 
-    def _ensure_group_dim(self, gid, dim):
+    def _resize_group(self, g, new_dim):
+        A_old, b_old, old_dim = g["A"], g["b"], g["dim"]
+        A_new = np.eye(new_dim, dtype=float); b_new = np.zeros(new_dim, dtype=float)
+        m = min(old_dim, new_dim)
+        A_new[:m, :m] = A_old[:m, :m]; b_new[:m] = b_old[:m]
+        g["A"], g["b"], g["dim"] = A_new, b_new, new_dim
+        return g
+
+    def _ensure_group(self, gid, dim):
         if gid not in self.groups:
-            self._init_or_reset_group(gid, dim)
+            self.groups[gid] = self._init_group(dim)
         elif self.groups[gid]["dim"] != dim:
-            # безопасность: если вдруг размер изменился — переинициализируем
-            self._init_or_reset_group(gid, dim)
+            self.groups[gid] = self._resize_group(self.groups[gid], dim)
 
     def select(self, gid, ctx_matrix, actions_matrix):
-        # ctx_matrix: (n_actions, d_ctx)
-        # actions_matrix: (n_actions, d_action)  # здесь d_action = len(ARM_GRID) – фиксированный
-        n = ctx_matrix.shape[0]
-        d = ctx_matrix.shape[1] + actions_matrix.shape[1]
-        self._ensure_group_dim(gid, d)
+        n = int(ctx_matrix.shape[0])
+        if n == 0:
+            return -1  # сигнализируем вызывающему: нечего выбирать
 
-        A = self.groups[gid]["A"]
-        b = self.groups[gid]["b"]
+        d_ctx = int(ctx_matrix.shape[1])
+        d_act = int(actions_matrix.shape[1])
+        d = d_ctx + d_act
+        self._ensure_group(gid, d)
+        g = self.groups[gid]
+        A, b = g["A"], g["b"]
         A_inv = np.linalg.inv(A)
 
         scores = []
         for i in range(n):
             x = np.concatenate([ctx_matrix[i], actions_matrix[i]])
-            theta = A_inv.dot(b)
-            mu = theta.dot(x)
-            sigma = np.sqrt(x.dot(A_inv).dot(x))
+            x = _pad_or_trim(x, g["dim"])
+            theta = _pad_or_trim(A_inv.dot(b), g["dim"])
+            mu = float(theta.dot(x))
+            sigma = float(np.sqrt(x.dot(A_inv).dot(x)))
             scores.append(mu + self.alpha * sigma)
+
         return int(np.argmax(scores))
 
     def update(self, gid, x, reward):
         d = x.shape[0]
-        self._ensure_group_dim(gid, d)
-        A = self.groups[gid]["A"]
-        b = self.groups[gid]["b"]
-        A += np.outer(x, x)
-        b += reward * x
-        self.groups[gid]["A"] = A
-        self.groups[gid]["b"] = b
-
+        self._ensure_group(gid, d)
+        g = self.groups[gid]
+        x = _pad_or_trim(x, g["dim"])
+        g["A"] += np.outer(x, x)
+        g["b"] += float(reward) * x
 
 # ====================================================
 # 7) Политика выбора цены (бандит + бизнес-ограничения)
@@ -428,47 +439,75 @@ def expected_profit(demand, price, cost_price):
 
  # 3) Полный код функции выбора цены с фиксированным action-вектором (глобальный one-hot по ARM_GRID)
 
-def choose_price_for_row(row, pipe, bandit, last_price, group_id):
-    # Кандидаты с учётом прайс-лестницы и ограничения шага
+ddef choose_price_for_row(row, pipe, bandit, last_price, group_id):
     base_price = row["BASE_PRICE"]
-    candidates = generate_candidates(base_price, last_price)
-    if len(candidates) == 0:
-        return np.nan, {"reason": "no_candidates"}
 
-    # Прогноз спроса на кандидатов
-    Xcand = pd.DataFrame([row] * len(candidates)).reset_index(drop=True)
+    # 1) кандидаты
+    candidates = generate_candidates(base_price, last_price)
+    # убираем NaN/неположительные/дубликаты
+    candidates = np.array([c for c in np.unique(candidates) if (pd.notna(c) and c > 0)], dtype=float)
+
+    # если сетка пустая — пробуем fallback на снап last_price → base ladder
+    if candidates.size == 0:
+        ladder = make_price_ladder(base_price)
+        if ladder.size == 0:
+            return np.nan, {"reason": "no_candidates"}
+        # ограничим шагом относительно last_price, если он валиден
+        if pd.notna(last_price) and last_price > 0:
+            lo, hi = last_price*(1-MAX_RELATIVE_STEP), last_price*(1+MAX_RELATIVE_STEP)
+            sl = ladder[(ladder >= lo) & (ladder <= hi)]
+            if sl.size > 0:
+                candidates = sl
+            else:
+                candidates = np.array([snap_price_to_grid(last_price, ladder)], dtype=float)
+        else:
+            # нет прошлой цены — возьмём ближайшее к BASE_PRICE
+            idx = int(np.argmin(np.abs(ladder - base_price)))
+            candidates = np.array([ladder[idx]], dtype=float)
+
+    # на этом этапе кандидатов >= 1
+    Xcand = pd.DataFrame([row] * int(candidates.size)).reset_index(drop=True)
     Xcand["SALE_PRICE"] = candidates
     demand_pred = predict_demand(pipe, Xcand)
 
-    # Оценка ожидаемой прибыли с учётом штрафа за риск OOS
     risk = float(row.get("RISK_OOS", 0.0))
     profits = []
     for q, p in zip(demand_pred, candidates):
         prof = expected_profit(q, p, row.get("BASE_PRICE", p)) * (1.0 - OOS_PENALTY * risk)
         profits.append(prof)
-    profits = np.array(profits)
+    profits = np.array(profits, dtype=float)
 
-    # ε-исследование
-    if np.random.rand() < EXPLORATION_EPS:
-        idx = np.random.randint(len(candidates))
+    # ε-explore (только если есть >1 канд.)
+    if candidates.size > 1 and np.random.rand() < EXPLORATION_EPS:
+        idx = np.random.randint(int(candidates.size))
         return float(candidates[idx]), {"reason": "epsilon_explore", "profit_est": float(profits[idx])}
 
-    # Контекст (фиксированная числовая часть)
+    # Контекст
     ctx_cols = [
         "IS_PROMO_NOW", "ONLINE_SHARE", "VOLATILITY_QTY_4W",
         "FAM_SALE_QTY", "CAT_SALE_QTY", "SEG_SALE_QTY", "REG_SALE_QTY", "STT_SALE_QTY",
         "ELAST1", "ELAST4", "AGE_WEEKS", "RISK_OOS"
     ]
     ctx = np.array([row.get(c, 0.0) for c in ctx_cols], dtype=float)
-    ctx_matrix = np.vstack([ctx] * len(candidates))
 
-    # Фиксированная action-матрица: one-hot длиной len(ARM_GRID) по глобальному мультипликатору
+    # Матрицы для бандита
+    ctx_matrix = np.vstack([ctx] * int(candidates.size))
     action_matrix = np.vstack([action_vector_from_price(p, base_price) for p in candidates])
 
-    # Выбор действия LinUCB (фиксированное измерение признаков)
-    idx = bandit.select(group_id, ctx_matrix, action_matrix)
-    chosen = float(candidates[idx])
+    # Если по какой-то причине n == 0 (не должно, но на всякий случай) — greedy fallback
+    if ctx_matrix.shape[0] == 0 or action_matrix.shape[0] == 0:
+        idx = int(np.argmax(profits))
+        return float(candidates[idx]), {"reason": "greedy_fallback_n0", "profit_est": float(profits[idx])}
 
+    # Вызов бандита
+    idx = bandit.select(group_id, ctx_matrix, action_matrix)
+
+    # Если бандит вернул -1 (наша защита в select), тоже greedy
+    if idx is None or idx < 0 or idx >= candidates.size:
+        idx = int(np.argmax(profits))
+        return float(candidates[idx]), {"reason": "greedy_fallback_idx", "profit_est": float(profits[idx])}
+
+    chosen = float(candidates[idx])
     return chosen, {
         "reason": "linucb",
         "profit_est": float(profits[idx]),
