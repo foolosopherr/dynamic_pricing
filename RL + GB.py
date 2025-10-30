@@ -1,694 +1,343 @@
-# -*- coding: utf-8 -*-
-# Полный, самодостаточный каркас с:
-# 1) weekly_df (агрегаты по неделе и 3 бакетам Mon–Thu, Fri, Sat–Sun; неделя = Mon..Sun)
-# 2) устойчивым к «shape» бандитом LinUCB (фикс. размер признаков, паддинги)
-# 3) безопасным выбором цены (без 0-кандидатов, greedy fallback)
-# 4) predict_next_week_prices (исправлено)
-# 5) recommend_for_run_date: запуск по дням Mon/Fri/Sat только нужного бакета
-#
-# Зависимости: numpy, pandas, scikit-learn
-
+# === Библиотеки ===
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
-from sklearn.preprocessing import OneHotEncoder
-from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline
-from sklearn.ensemble import GradientBoostingRegressor
 
-# =========================
-# Константы и настройки
-# =========================
+# ==========================================================
+# 0) Настройки и вспомогательные таблицы
+# ==========================================================
 
-# Бакеты: Mon–Thu, Fri, Sat–Sun (понедельник=0)
+# Корзины: цена фиксируется внутри корзины, меняется только между ними
 BUCKETS = {
-    "Mon-Thu": [0, 1, 2, 3],
-    "Fri":     [4],
-    "Sat-Sun": [5, 6]
+    "Mon-Thu": [0,1,2,3],   # Пн..Чт (0=Monday)
+    "Fri":     [4],         # Пт
+    "Sat-Sun": [5,6],       # Сб..Вс
 }
+BUCKET_ORDER = ["Mon-Thu", "Fri", "Sat-Sun"]
 
-# Глобальная сетка мультипликаторов (фиксированная размерность действий)
-ARM_GRID = np.round(np.arange(0.90, 1.30 + 0.001, 0.02), 2)
+# Дискретные действия: мультипликаторы к "якорной" цене
+PRICE_MULTS = np.round(np.arange(0.90, 1.301, 0.05), 2)  # 0.90..1.30 с шагом 0.05
 
-MAX_RELATIVE_STEP = 0.10     # ограничение изменения цены vs прошлый бакет
-MIN_GROSS_MARGIN = 0.05      # минимальная валовая маржа
-OOS_PENALTY = 0.30           # штраф за риск OOS
-EXPLORATION_EPS = 0.05       # эпсилон-исследование
+END_OF_HISTORY = pd.to_datetime("2025-09-15")  # как в условиях
+ROLL_WEEKS = 12  # окно истории для фич
 
-# Исторический срез (не читаем будущее)
-END_OF_HISTORY = pd.Timestamp("2025-09-15")
+# Если данных нет — можно включить игрушечную генерацию
+USE_SYNTHETIC = True
 
+# ==========================================================
+# 1) Загрузка/создание данных
+# Столбцы из задачи (минимальный поднабор для примера):
+# TRADE_DT, IS_PROMO, SALE_QTY, SALE_PRICE, START_STOCK, END_STOCK,
+# PRODUCT_CODE, FAMILY_CODE, CATEGORY_CODE, SEGMENT_CODE,
+# STORE, STORE_TYPE, REGION_NAME, BASE_PRICE, PROMO_PERIOD, PLACE_TYPE
+# + допускаем SALE_PRICE_TOTAL и пр., если есть.
+# ==========================================================
 
-# ==================================
-# Утилиты дат/недель/промо
-# ==================================
+if USE_SYNTHETIC:
+    np.random.seed(7)
+    # Сгенерируем ~20 недель истории для 2 магазинов × 6 SKU
+    start_date = END_OF_HISTORY - pd.Timedelta(days=7*20-1)
+    dates = pd.date_range(start_date, END_OF_HISTORY, freq="D")
+    stores = ["S1", "S2"]
+    skus = [f"SKU{i}" for i in range(6)]
+    families = {"SKU0":"F1","SKU1":"F1","SKU2":"F2","SKU3":"F2","SKU4":"F3","SKU5":"F3"}
+    cats = {"F1":"C1","F2":"C2","F3":"C3"}
+    segs = {"C1":"SEGA","C2":"SEGB","C3":"SEGC"}
 
-def week_start_monday(d):
-    # возвращает monday (00:00) недели, где d — Timestamp/датa
-    d = pd.to_datetime(d)
-    return (d - pd.Timedelta(days=int(d.weekday()))).normalize()
+    rows = []
+    for d in dates:
+        for s in stores:
+            for p in skus:
+                base_price = 10 + 2*(int(p[-1])%3)
+                is_promo = np.random.rand() < 0.15
+                # спрос ~ exp(α - β*price) + шум
+                true_beta = 0.15 + 0.05*(int(p[-1])%3)
+                price = base_price * np.random.choice([0.95, 1.0, 1.05])
+                if is_promo:
+                    price = base_price * 0.9
+                mu = np.exp(2.2 - true_beta*(price/base_price))
+                qty = np.random.poisson(mu)
+                start_stock = 100
+                end_stock = max(0, start_stock - qty + np.random.randint(0,3))
+                promo_start = d - pd.Timedelta(days=np.random.randint(0,10))
+                promo_end = promo_start + pd.Timedelta(days=np.random.randint(0,3))
+                promo_str = f"{promo_start.strftime('%d-%m-%Y')} - {promo_end.strftime('%d-%m-%Y')}" if is_promo else None
+                rows.append({
+                    "TRADE_DT": d,
+                    "IS_PROMO": int(is_promo),
+                    "SALE_QTY": qty,
+                    "SALE_PRICE": price,
+                    "START_STOCK": start_stock,
+                    "END_STOCK": end_stock,
+                    "PRODUCT_CODE": p,
+                    "FAMILY_CODE": families[p],
+                    "CATEGORY_CODE": cats[families[p]],
+                    "SEGMENT_CODE": segs[cats[families[p]]],
+                    "STORE": s,
+                    "STORE_TYPE": "A" if s=="S1" else "B",
+                    "REGION_NAME": "North" if s=="S1" else "South",
+                    "BASE_PRICE": base_price,
+                    "PROMO_PERIOD": promo_str,
+                    "PLACE_TYPE": None,
+                })
+    df = pd.DataFrame(rows)
+else:
+    # Пример: df = pd.read_parquet("sales.parquet")
+    # df['TRADE_DT'] = pd.to_datetime(df['TRADE_DT'])
+    # Для воспроизводимости оставим как заглушку:
+    raise ValueError("Замените на загрузку ваших данных и выключите USE_SYNTHETIC.")
 
-def week_end_sunday(d):
-    # конец недели (вс) 23:59:59
-    start = week_start_monday(d)
-    return start + pd.Timedelta(days=6, hours=23, minutes=59, seconds=59)
+# ==========================================================
+# 2) Парсинг PROMO_PERIOD в интервалы и признаки корзины
+# ==========================================================
 
-def week_id(dt):
-    iso = pd.Timestamp(dt).isocalendar()
-    return f"{int(iso.year)}-W{int(iso.week):02d}"
+def parse_promo_period_to_intervals(x):
+    # Парсим строку вида '01-01-2024 - 03-01-2024' -> (start,end)
+    if not isinstance(x, str) or "-" not in x:
+        return pd.NaT, pd.NaT
+    # Строка может содержать пробелы; разделим по ' - '
+    parts = [t.strip() for t in x.split("-")]
+    # На всякий случай склеим 2 части обратно на формат 'dd-mm-yyyy - dd-mm-yyyy'
+    if len(parts) >= 4:
+        start = f"{parts[0]}-{parts[1]}-{parts[2]}"
+        end = f"{parts[3]}-{parts[4]}-{parts[5]}" if len(parts)>=6 else None
+    else:
+        # более простой разбор
+        try:
+            l, r = x.split(" - ")
+            start = l.strip()
+            end = r.strip()
+        except:
+            return pd.NaT, pd.NaT
+    try:
+        start = pd.to_datetime(start, format="%d-%m-%Y", errors="coerce")
+        end = pd.to_datetime(end, format="%d-%m-%Y", errors="coerce")
+    except:
+        return pd.NaT, pd.NaT
+    return start, end
 
-def date_bucket(ts):
-    wd = pd.Timestamp(ts).weekday()
-    for name, wds in BUCKETS.items():
-        if wd in wds:
-            return name
+df["PROMO_START"], df["PROMO_END"] = zip(*df["PROMO_PERIOD"].map(parse_promo_period_to_intervals))
+
+# День недели, неделя ISO и корзина
+df["DOW"] = df["TRADE_DT"].dt.weekday
+def dow_to_bucket(dow):
+    for b, dows in BUCKETS.items():
+        if dow in dows:
+            return b
     return "Mon-Thu"
 
-def parse_promo_period(s):
-    if pd.isna(s) or not isinstance(s, str) or "-" not in s:
-        return None, None
-    try:
-        parts = s.split("-")
-        left = "-".join(parts[:3]).strip()
-        right = "-".join(parts[3:]).strip()
-        start = datetime.strptime(left, "%d-%m-%Y").date()
-        end = datetime.strptime(right, "%d-%m-%Y").date()
-        return start, end
-    except:
-        return None, None
-    
-# ---- Week helpers (put near other date utils) ----
+df["BUCKET_ID"] = df["DOW"].map(dow_to_bucket)
+df["WEEK_ID"] = df["TRADE_DT"].dt.isocalendar().week.astype(int)
+df["YEAR"] = df["TRADE_DT"].dt.isocalendar().year.astype(int)
+df["YEARWEEK"] = df["YEAR"]*100 + df["WEEK_ID"]
 
-def monday_from_week_id(next_week_id):
-    # Accepts 'YYYY-Www' or a date-like string; returns Monday Timestamp.
-    try:
-        if "W" in next_week_id:
-            y, w = next_week_id.split("-W")
-            y = int(y); w = int(w)
-            # ISO week: Monday is the first day
-            return pd.Timestamp.fromisocalendar(y, w, 1).normalize()
-        # else treat as date
-        return week_start_monday(pd.Timestamp(next_week_id))
-    except Exception:
-        # fallback: try parse as date anyway
-        return week_start_monday(pd.Timestamp(next_week_id))
-    
+# Флаг "промо активно в этот день"
+df["IS_PROMO_ACTIVE"] = (
+    (df["TRADE_DT"] >= df["PROMO_START"]) &
+    (df["TRADE_DT"] <= df["PROMO_END"])
+).fillna(False).astype(int)
 
-def ensure_future_week_in_weekly_df(raw_df, weekly_df, next_week_id):
-    """
-    If weekly_df has no rows for next_week_id, create a future-week template
-    from raw_df (Mon..Sun, 3 buckets) and rebuild weekly_df so lags/hierarchy exist.
-    """
-    # already present?
-    if (weekly_df["WEEK_ID"] == next_week_id).any():
-        return weekly_df
+# ==========================================================
+# 3) Агрегация до уровня (STORE, PRODUCT, YEARWEEK, BUCKET_ID)
+#    и подготовка «скелета» строк (чтобы присутствовали нули)
+# ==========================================================
 
-    # Build template rows for that week
-    monday = monday_from_week_id(next_week_id)
-    fut = create_future_week_template(raw_df, monday)
-    if fut.empty:
-        # Nothing to add — keep as-is; caller will still error out
-        return weekly_df
+# Список всех комбинаций для скелета
+keys = ["STORE","PRODUCT_CODE"]
+calendar = df[["YEARWEEK","BUCKET_ID","YEAR"]].drop_duplicates()
+universe_left = df[keys].drop_duplicates()
+skeleton = universe_left.merge(calendar, how="cross")
 
-    # Merge with history and recompute features
-    df_hist = prepare_raw(raw_df)
-    # put a TRADE_DT for future rows (monday) so prepare_raw sets WEEK_ID/BUCKET
-    fut = fut.assign(TRADE_DT=monday)
-    combined = pd.concat([df_hist, fut], ignore_index=True, sort=False)
-    combined = prepare_raw(combined)  # re-derive WEEK_ID/BUCKET/etc.
-    weekly = weekly_aggregates(combined)
-    return weekly
+# Реальная агрегация
+agg = df.groupby(keys + ["YEARWEEK","BUCKET_ID","YEAR"], as_index=False).agg({
+    "SALE_QTY":"sum",
+    "SALE_PRICE":"mean",
+    "BASE_PRICE":"mean",
+    "IS_PROMO_ACTIVE":"max",
+    "START_STOCK":"mean",
+    "END_STOCK":"mean",
+})
 
+# Соединяем: пропуски → нули
+weekly = skeleton.merge(agg, on=keys+["YEARWEEK","BUCKET_ID","YEAR"], how="left")
+for col in ["SALE_QTY","IS_PROMO_ACTIVE"]:
+    weekly[col] = weekly[col].fillna(0)
+for col in ["SALE_PRICE","BASE_PRICE","START_STOCK","END_STOCK"]:
+    weekly[col] = weekly[col].fillna(method="ffill")  # мягкое заполнение по времени в реальном проекте делайте аккуратнее
 
+# «Якорная» цена: последняя известная или BASE_PRICE
+weekly["ANCHOR_PRICE"] = weekly["SALE_PRICE"].fillna(weekly["BASE_PRICE"])
+weekly["ANCHOR_PRICE"] = weekly["ANCHOR_PRICE"].replace(0, weekly["BASE_PRICE"])
 
-# ==================================
-# Подготовка сырых данных
-# ==================================
+# ==========================================================
+# 4) Признаки на 12-недельном окне (просто и понятно)
+# ==========================================================
 
-def prepare_raw(df):
-    df = df.copy()
-    df["TRADE_DT"] = pd.to_datetime(df["TRADE_DT"]).dt.tz_localize(None)
-    df = df[df["TRADE_DT"] <= END_OF_HISTORY].copy()
+weekly = weekly.sort_values(keys+["YEARWEEK","BUCKET_ID"])
 
-    df["WEEK_START"] = df["TRADE_DT"].apply(week_start_monday)
-    df["WEEK_END"] = df["TRADE_DT"].apply(week_end_sunday)
-    df["WEEK_ID"] = df["TRADE_DT"].apply(week_id)
-    df["BUCKET"] = df["TRADE_DT"].apply(date_bucket)
-    df["DOW"] = df["TRADE_DT"].dt.weekday
-    df["IS_WEEKEND"] = df["DOW"].isin([5, 6]).astype(int)
+def add_roll_feats(g):
+    g = g.sort_values(["YEARWEEK","BUCKET_ID"])
+    # окно последних 12 недель: агрегации по корзинам внутри недели уже сделаны
+    g["QTY_12W"] = g["SALE_QTY"].rolling(ROLL_WEEKS, min_periods=1).sum()
+    g["REV_12W"] = (g["SALE_QTY"]*g["SALE_PRICE"]).rolling(ROLL_WEEKS, min_periods=1).sum()
+    g["AVG_PRICE_12W"] = g["SALE_PRICE"].rolling(ROLL_WEEKS, min_periods=1).mean()
+    g["PROMO_RATE_12W"] = g["IS_PROMO_ACTIVE"].rolling(ROLL_WEEKS, min_periods=1).mean()
+    # простая «прокси-эластичность»: ковариация qty и price на окне
+    qty = g["SALE_QTY"].fillna(0)
+    prc = g["SALE_PRICE"].fillna(g["BASE_PRICE"])
+    cov = (qty - qty.rolling(ROLL_WEEKS).mean())*(prc - prc.rolling(ROLL_WEEKS).mean())
+    var = (prc - prc.rolling(ROLL_WEEKS).mean())**2
+    g["ELAST_PROXY"] = (cov.rolling(ROLL_WEEKS).sum() / (var.rolling(ROLL_WEEKS).sum()+1e-6)).fillna(0.0)
+    return g
 
-    se = df["PROMO_PERIOD"].apply(parse_promo_period)
-    df["PROMO_START"] = se.apply(lambda x: x[0])
-    df["PROMO_END"] = se.apply(lambda x: x[1])
-    dts = df["TRADE_DT"].dt.date
-    df["IS_PROMO_NOW"] = ((~df["PROMO_START"].isna()) &
-                          (dts >= df["PROMO_START"]) &
-                          (dts <= df["PROMO_END"])).astype(int)
+weekly = weekly.groupby(keys, group_keys=False).apply(add_roll_feats)
 
-    for c in ["SALE_QTY", "SALE_QTY_ONLINE", "LOSS_QTY", "RETURN_QTY",
-              "DELIVERY_QTY", "START_STOCK", "END_STOCK"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
-    for c in ["SALE_PRICE", "SALE_PRICE_ONLINE", "BASE_PRICE"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["BASE_PRICE"] = df["BASE_PRICE"].fillna(df["SALE_PRICE"])
-    return df
+# Запасы и риск OOS (очень грубо)
+weekly["OOS_RISK"] = (weekly["END_STOCK"] < weekly["SALE_QTY"].rolling(3, min_periods=1).mean()*2).astype(int)
 
+# ==========================================================
+# 5) Price ladder + округление .99
+# ==========================================================
 
-# ============================================
-# weekly_df: недельно-бакетные аггрегаты (+лаги)
-# ============================================
+def snap_ending_99(x):
+    # Округляем так, чтобы получить ... .99 (примерно)
+    r = np.floor(x) + 0.99
+    if r <= 0:
+        r = x
+    return r
 
-def weekly_aggregates(df):
-    key = ["STORE", "PRODUCT_CODE", "WEEK_ID", "BUCKET"]
-    agg = df.groupby(key).agg({
-        "SALE_QTY": "sum",
-        "SALE_QTY_ONLINE": "sum",
-        "SALE_PRICE": "mean",
-        "SALE_PRICE_ONLINE": "mean",
-        "IS_PROMO_NOW": "max",
-        "START_STOCK": "mean",
-        "END_STOCK": "mean",
-        "DELIVERY_QTY": "sum",
-        "LOSS_QTY": "sum",
-        "RETURN_QTY": "sum",
-        "BASE_PRICE": "mean",
-        "FAMILY_CODE": "first",
-        "CATEGORY_CODE": "first",
-        "SEGMENT_CODE": "first",
-        "STORE_TYPE": "first",
-        "REGION_NAME": "first"
-    }).reset_index()
+def build_price_candidates(anchor_price, base_price, is_promo):
+    # Отдельные ладдеры можно сделать для промо/непромо; здесь — один общий
+    raw = anchor_price * PRICE_MULTS
+    # ограничение относительно BASE_PRICE (пример)
+    low = 0.7 * base_price
+    high = 1.5 * base_price
+    clipped = np.clip(raw, low, high)
+    # Округляем к .99
+    snapped = np.array([snap_ending_99(v) for v in clipped])
+    # Убираем дубликаты
+    return np.unique(np.round(snapped, 2))
 
-    agg = agg.sort_values(["STORE", "PRODUCT_CODE", "BUCKET", "WEEK_ID"])
-
-    def add_lags(g):
-        g = g.copy()
-        for w in [1, 2, 4, 8, 12]:
-            g[f"LAG_SALE_QTY_{w}"] = g["SALE_QTY"].shift(w)
-            g[f"LAG_PRICE_{w}"]    = g["SALE_PRICE"].shift(w)
-            g[f"LAG_PROMO_{w}"]    = g["IS_PROMO_NOW"].shift(w)
-        g["ELAST1"] = (g["SALE_QTY"] - g["LAG_SALE_QTY_1"]) / (g["SALE_PRICE"] - g["LAG_PRICE_1"] + 1e-6)
-        g["ELAST4"] = (g["SALE_QTY"] - g["LAG_SALE_QTY_4"]) / (g["SALE_PRICE"] - g["LAG_PRICE_4"] + 1e-6)
-        g["RISK_OOS"] = ((g["END_STOCK"] < np.maximum(1.0, 0.3 * (g["SALE_QTY"] + 1))) &
-                         (g["SALE_QTY"] > 0)).astype(int)
-        total_qty = g["SALE_QTY"] + g["SALE_QTY_ONLINE"]
-        g["ONLINE_SHARE"] = np.where(total_qty > 0, g["SALE_QTY_ONLINE"] / total_qty, 0.0)
-        g["VOLATILITY_QTY_4W"] = g["SALE_QTY"].rolling(4, min_periods=1).std().fillna(0.0)
-        return g
-
-    agg = agg.groupby(["STORE", "PRODUCT_CODE", "BUCKET"], group_keys=False).apply(add_lags).reset_index(drop=True)
-
-    def make_hier(dfwk, key_cols, prefix):
-        tmp = dfwk.groupby(key_cols).agg({
-            "SALE_QTY": "sum",
-            "SALE_PRICE": "mean",
-            "IS_PROMO_NOW": "mean"
-        }).rename(columns={
-            "SALE_QTY": f"{prefix}_SALE_QTY",
-            "SALE_PRICE": f"{prefix}_PRICE",
-            "IS_PROMO_NOW": f"{prefix}_PROMO"
-        }).reset_index()
-        return tmp
-
-    fam = make_hier(agg, ["STORE", "FAMILY_CODE", "WEEK_ID", "BUCKET"], "FAM")
-    cat = make_hier(agg, ["STORE", "CATEGORY_CODE", "WEEK_ID", "BUCKET"], "CAT")
-    seg = make_hier(agg, ["STORE", "SEGMENT_CODE", "WEEK_ID", "BUCKET"], "SEG")
-    reg = make_hier(agg, ["REGION_NAME", "WEEK_ID", "BUCKET"], "REG")
-    stt = make_hier(agg, ["STORE_TYPE", "WEEK_ID", "BUCKET"], "STT")
-
-    m = agg.merge(fam, on=["STORE", "FAMILY_CODE", "WEEK_ID", "BUCKET"], how="left")
-    m = m.merge(cat, on=["STORE", "CATEGORY_CODE", "WEEK_ID", "BUCKET"], how="left")
-    m = m.merge(seg, on=["STORE", "SEGMENT_CODE", "WEEK_ID", "BUCKET"], how="left")
-    m = m.merge(reg, on=["REGION_NAME", "WEEK_ID", "BUCKET"], how="left")
-    m = m.merge(stt, on=["STORE_TYPE", "WEEK_ID", "BUCKET"], how="left")
-
-    for c in m.columns:
-        if m[c].dtype.kind in "fc" and m[c].isna().any():
-            m[c] = m[c].fillna(m[c].median())
-    m["AGE_WEEKS"] = m.groupby(["STORE", "PRODUCT_CODE", "BUCKET"]).cumcount() + 1
-    return m
-
-
-def create_future_week_template(raw_df, target_week_monday):
-    # Создаёт пустые строки на неделю target_week_monday (Mon..Sun) по всем STORE×PRODUCT_CODE×3 бакета
-    # BASE_PRICE берём последнюю известную (SALE_PRICE/BASE_PRICE) до target_week
-    df = prepare_raw(raw_df)
-    cutoff = pd.Timestamp(target_week_monday) - pd.Timedelta(seconds=1)
-
-    # Последние известные цены/иерархия
-    df_hist = df[df["TRADE_DT"] <= cutoff].copy().sort_values("TRADE_DT")
-    last_rows = df_hist.groupby(["STORE", "PRODUCT_CODE"]).tail(1)
-
-    if last_rows.empty:
-        return pd.DataFrame(columns=[
-            "STORE","PRODUCT_CODE","WEEK_ID","BUCKET","BASE_PRICE",
-            "FAMILY_CODE","CATEGORY_CODE","SEGMENT_CODE","STORE_TYPE","REGION_NAME",
-            "SALE_QTY","SALE_QTY_ONLINE","SALE_PRICE","SALE_PRICE_ONLINE","IS_PROMO_NOW",
-            "START_STOCK","END_STOCK","DELIVERY_QTY","LOSS_QTY","RETURN_QTY",
-        ])
-
-    # Конструируем 3 бакета на целевую неделю
-    wk_id = week_id(pd.Timestamp(target_week_monday))
-    records = []
-    for _, r in last_rows.iterrows():
-        base_price = r["BASE_PRICE"] if pd.notna(r["BASE_PRICE"]) and r["BASE_PRICE"]>0 else r["SALE_PRICE"]
-        for b in BUCKETS.keys():
-            records.append({
-                "STORE": r["STORE"],
-                "PRODUCT_CODE": r["PRODUCT_CODE"],
-                "WEEK_ID": wk_id,
-                "BUCKET": b,
-                "BASE_PRICE": base_price,
-                "FAMILY_CODE": r["FAMILY_CODE"],
-                "CATEGORY_CODE": r["CATEGORY_CODE"],
-                "SEGMENT_CODE": r["SEGMENT_CODE"],
-                "STORE_TYPE": r["STORE_TYPE"],
-                "REGION_NAME": r["REGION_NAME"],
-                "SALE_QTY": 0.0,
-                "SALE_QTY_ONLINE": 0.0,
-                "SALE_PRICE": np.nan,
-                "SALE_PRICE_ONLINE": np.nan,
-                "IS_PROMO_NOW": 0,
-                "START_STOCK": 0.0,
-                "END_STOCK": 0.0,
-                "DELIVERY_QTY": 0.0,
-                "LOSS_QTY": 0.0,
-                "RETURN_QTY": 0.0
-            })
-    return pd.DataFrame(records)
-
-
-# =================================
-# Сетка цен и действия (фикс. размер)
-# =================================
-
-def make_price_ladder(base_price):
-    if pd.isna(base_price) or base_price <= 0:
-        return np.array([])
-    return np.unique(np.round(base_price * ARM_GRID, 4))
-
-def snap_price_to_grid(candidate, ladder):
-    if len(ladder) == 0:
-        return np.nan
-    idx = np.argmin(np.abs(ladder - candidate))
-    return float(ladder[idx])
-
-def generate_candidates(base_price, last_price):
-    ladder = make_price_ladder(base_price)
-    if len(ladder) == 0:
-        return np.array([])
-    if pd.isna(last_price) or last_price <= 0:
-        return ladder
-    lo, hi = last_price*(1-MAX_RELATIVE_STEP), last_price*(1+MAX_RELATIVE_STEP)
-    rng = ladder[(ladder >= lo) & (ladder <= hi)]
-    if len(rng) == 0:
-        return np.array([snap_price_to_grid(last_price, ladder)])
-    return rng
-
-def price_to_multiplier(price, base_price):
-    if pd.isna(price) or pd.isna(base_price) or base_price <= 0:
-        return np.nan
-    m = np.round(price / base_price, 2)
-    idx = np.argmin(np.abs(ARM_GRID - m))
-    return ARM_GRID[idx]
-
-def action_vector_from_price(price, base_price):
-    vec = np.zeros(len(ARM_GRID), dtype=float)
-    m = price_to_multiplier(price, base_price)
-    if pd.isna(m):
-        return vec
-    idx = int(np.where(np.isclose(ARM_GRID, m))[0][0])
-    vec[idx] = 1.0
-    return vec
-
-
-# ============================================
-# Модель спроса (ML-приближение отклика)
-# ============================================
-
-def build_demand_model():
-    cat_cols = ["BUCKET", "STORE_TYPE", "REGION_NAME"]
-    num_cols = [
-        "SALE_PRICE", "BASE_PRICE",
-        "LAG_SALE_QTY_1","LAG_SALE_QTY_2","LAG_SALE_QTY_4","LAG_SALE_QTY_8","LAG_SALE_QTY_12",
-        "LAG_PRICE_1","LAG_PRICE_2","LAG_PRICE_4","LAG_PRICE_8","LAG_PRICE_12",
-        "LAG_PROMO_1","LAG_PROMO_2","LAG_PROMO_4","LAG_PROMO_8","LAG_PROMO_12",
-        "ELAST1","ELAST4","ONLINE_SHARE","VOLATILITY_QTY_4W","IS_PROMO_NOW",
-        "FAM_SALE_QTY","CAT_SALE_QTY","SEG_SALE_QTY","REG_SALE_QTY","STT_SALE_QTY",
-        "FAM_PRICE","CAT_PRICE","SEG_PRICE","REG_PRICE","STT_PRICE",
-        "AGE_WEEKS","RISK_OOS"
-    ]
-    pre = ColumnTransformer(
-        transformers=[
-            ("cat", OneHotEncoder(handle_unknown="ignore"), cat_cols),
-            ("num", "passthrough", num_cols)
-        ],
-        remainder="drop"
-    )
-    model = GradientBoostingRegressor(random_state=42)
-    pipe = Pipeline([("pre", pre), ("gbm", model)])
-    return pipe, cat_cols + num_cols
-
-def fit_demand_model(pipe, df_train):
-    use = df_train.copy().replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    X = use
-    y = use["SALE_QTY"].values
-    pipe.fit(X, y)
-    return pipe
-
-def predict_demand(pipe, Xcand):
-    Xc = Xcand.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    return pipe.predict(Xc)
-
-
-# ============================================
-# Устойчивый LinUCB (фикс. размер, паддинги)
-# ============================================
-
-def _pad_or_trim(vec, target_dim):
-    d = vec.shape[0]
-    if d == target_dim:
-        return vec
-    if d < target_dim:
-        out = np.zeros(target_dim, dtype=float)
-        out[:d] = vec
-        return out
-    return vec[:target_dim]
+# ==========================================================
+# 6) Простой контекстный бандит LinUCB (глобальный, для простоты)
+#    Φ = [1, log_price_candidate/base_price, promo_flag, oos_risk, elast_proxy, ...]
+# ==========================================================
 
 class LinUCB:
-    def __init__(self, alpha=1.0):
+    def __init__(self, d, alpha):
+        # d — размерность признаков; alpha — коэффициент уверенности (exploration)
+        self.d = d
         self.alpha = alpha
-        self.groups = {}  # gid -> {"A":, "b":, "dim": int}
+        self.A = np.eye(d)
+        self.b = np.zeros(d)
 
-    def _init_group(self, dim):
-        return {"A": np.eye(dim, dtype=float), "b": np.zeros(dim, dtype=float), "dim": dim}
+    def _theta(self):
+        return np.linalg.solve(self.A, self.b)
 
-    def _resize_group(self, g, new_dim):
-        A_old, b_old, old_dim = g["A"], g["b"], g["dim"]
-        A_new = np.eye(new_dim, dtype=float)
-        b_new = np.zeros(new_dim, dtype=float)
-        m = min(old_dim, new_dim)
-        A_new[:m, :m] = A_old[:m, :m]
-        b_new[:m] = b_old[:m]
-        g["A"], g["b"], g["dim"] = A_new, b_new, new_dim
-        return g
+    def predict_ucb(self, X):
+        # X: матрица кандидатов (n_actions × d)
+        A_inv = np.linalg.inv(self.A)
+        theta = self._theta()
+        mu = X.dot(theta)
+        s = np.sqrt(np.sum(X.dot(A_inv)*X, axis=1))
+        return mu + self.alpha * s
 
-    def _ensure_group(self, gid, dim):
-        if gid not in self.groups:
-            self.groups[gid] = self._init_group(dim)
-        elif self.groups[gid]["dim"] != dim:
-            self.groups[gid] = self._resize_group(self.groups[gid], dim)
+    def update(self, x, reward):
+        # x — вектор признаков выбранного действия
+        self.A += np.outer(x, x)
+        self.b += x * reward
 
-    def select(self, gid, ctx_matrix, actions_matrix):
-        n = int(ctx_matrix.shape[0])
-        if n == 0:
-            return -1
-        d_ctx = int(ctx_matrix.shape[1])
-        d_act = int(actions_matrix.shape[1])  # == len(ARM_GRID)
-        d = d_ctx + d_act
-        self._ensure_group(gid, d)
-        g = self.groups[gid]
-        A, b = g["A"], g["b"]
-        A_inv = np.linalg.inv(A)
+def make_features_row(r, candidate_price):
+    # Минимальный набор контекста; расширяйте со временем
+    base_price = r["BASE_PRICE"] if r["BASE_PRICE"]>0 else max(r["ANCHOR_PRICE"], 1.0)
+    log_ratio = np.log(max(candidate_price, 0.01)/max(base_price, 0.01))
+    return np.array([
+        1.0,
+        log_ratio,
+        float(r["IS_PROMO_ACTIVE"]),
+        float(r["OOS_RISK"]),
+        float(r["ELAST_PROXY"]),
+        float(r["QTY_12W"]>0),
+    ])
 
-        scores = []
-        for i in range(n):
-            x = np.concatenate([ctx_matrix[i], actions_matrix[i]])
-            x = _pad_or_trim(x, g["dim"])
-            theta = _pad_or_trim(A_inv.dot(b), g["dim"])
-            mu = float(theta.dot(x))
-            sigma = float(np.sqrt(x.dot(A_inv).dot(x)))
-            scores.append(mu + self.alpha * sigma)
+# Инициализация бандита
+d = 6
+alpha = 1.0
+bandit = LinUCB(d=d, alpha=alpha)
 
-        return int(np.argmax(scores))
+# ==========================================================
+# 7) Offline "replay" для тёплого старта
+#    Идея: считаем, что исторически выбранная цена ~ одно из действий (ближайший кандидат),
+#    reward = прибыль за корзину = (price - "себестоимость")*qty (здесь себестоимость неизвестна -> используем долю от BASE_PRICE).
+# ==========================================================
 
-    def update(self, gid, x, reward):
-        d = x.shape[0]
-        self._ensure_group(gid, d)
-        g = self.groups[gid]
-        x = _pad_or_trim(x, g["dim"])
-        g["A"] += np.outer(x, x)
-        g["b"] += float(reward) * x
+def nearest_candidate(cands, observed_price):
+    idx = np.argmin(np.abs(cands - observed_price))
+    return cands[idx]
 
+# Сделаем грубую себестоимость как 0.7*BASE_PRICE (замените на вашу)
+COST_RATE = 0.7
 
-# ============================================
-# Политика выбора цены (без 0-кандидатов)
-# ============================================
+weekly = weekly.sort_values(keys+["YEARWEEK","BUCKET_ID"])
+history_mask = weekly["TRADE_DT"].isna()  # нет TRADE_DT после агрегации; используем год/неделю как порядок
+# Для простоты — используем все строки до END_OF_HISTORY (они и так до него)
+history = weekly.copy()
 
-def expected_profit(demand, price, cost_price):
-    margin = 0.25
-    cost = price * (1 - margin)
-    min_cost = price * (1 - MIN_GROSS_MARGIN)
-    cost = min(cost, min_cost)
-    return np.maximum(0.0, price - cost) * np.maximum(0.0, demand)
+# Реплей: проходим по истории в хронологическом порядке и обновляем бандит
+for _, r in history.iterrows():
+    anchor = r["ANCHOR_PRICE"] if r["ANCHOR_PRICE"]>0 else r["BASE_PRICE"]
+    cands = build_price_candidates(anchor, r["BASE_PRICE"], r["IS_PROMO_ACTIVE"])
+    if len(cands)==0:
+        continue
+    # Какая цена фактически была?
+    observed_price = r["SALE_PRICE"] if r["SALE_PRICE"]>0 else anchor
+    chosen = nearest_candidate(cands, observed_price)
+    x = make_features_row(r, chosen)
+    cost = COST_RATE * max(r["BASE_PRICE"], 0.01)
+    reward = (chosen - cost) * r["SALE_QTY"]
+    bandit.update(x, reward)
 
-def choose_price_for_row(row, pipe, bandit, last_price, group_id):
-    base_price = row["BASE_PRICE"]
+# ==========================================================
+# 8) Рекомендации на «следующую корзину»
+#    Выберем дату-таргет: следующий день после END_OF_HISTORY,
+#    определим его корзину и сгенерируем рекомендации.
+# ==========================================================
 
-    # Кандидаты и чистка
-    candidates = generate_candidates(base_price, last_price)
-    candidates = np.array([c for c in np.unique(candidates) if (pd.notna(c) and c > 0)], dtype=float)
+next_day = END_OF_HISTORY + pd.Timedelta(days=1)
+target_dow = next_day.weekday()
+# Какая корзина у целевого дня?
+for b, dows in BUCKETS.items():
+    if target_dow in dows:
+        target_bucket = b
+        break
 
-    if candidates.size == 0:
-        ladder = make_price_ladder(base_price)
-        if ladder.size == 0:
-            return np.nan, {"reason": "no_candidates"}
-        if pd.notna(last_price) and last_price > 0:
-            lo, hi = last_price*(1-MAX_RELATIVE_STEP), last_price*(1+MAX_RELATIVE_STEP)
-            sl = ladder[(ladder >= lo) & (ladder <= hi)]
-            if sl.size > 0:
-                candidates = sl
-            else:
-                candidates = np.array([snap_price_to_grid(last_price, ladder)], dtype=float)
-        else:
-            idx = int(np.argmin(np.abs(ladder - base_price)))
-            candidates = np.array([ladder[idx]], dtype=float)
+# Берём последнее наблюдение по каждому (STORE, PRODUCT) перед целевой неделей/корзиной
+weekly["DATE_PROXY"] = pd.to_datetime(weekly["YEAR"].astype(str) + "-1", format="%Y-%j") + \
+                       (weekly["WEEK_ID"]-1).astype("timedelta64[W]")
 
-    Xcand = pd.DataFrame([row] * int(candidates.size)).reset_index(drop=True)
-    Xcand["SALE_PRICE"] = candidates
-    demand_pred = predict_demand(pipe, Xcand)
+latest = weekly.sort_values(keys+["YEARWEEK","BUCKET_ID"]).groupby(keys, as_index=False).tail(1).copy()
+latest["TARGET_BUCKET"] = target_bucket
 
-    risk = float(row.get("RISK_OOS", 0.0))
-    profits = []
-    for q, p in zip(demand_pred, candidates):
-        prof = expected_profit(q, p, row.get("BASE_PRICE", p)) * (1.0 - OOS_PENALTY * risk)
-        profits.append(prof)
-    profits = np.array(profits, dtype=float)
+recs = []
+for _, r in latest.iterrows():
+    anchor = r["ANCHOR_PRICE"] if r["ANCHOR_PRICE"]>0 else r["BASE_PRICE"]
+    cands = build_price_candidates(anchor, r["BASE_PRICE"], 0)
+    if len(cands)==0:
+        continue
+    # Собираем X для всех кандидатов и считаем UCB
+    X = np.vstack([make_features_row(r, cp) for cp in cands])
+    ucb = bandit.predict_ucb(X)
+    best_idx = int(np.argmax(ucb))
+    best_price = float(cands[best_idx])
+    recs.append({
+        "STORE": r["STORE"],
+        "PRODUCT_CODE": r["PRODUCT_CODE"],
+        "TARGET_BUCKET": target_bucket,
+        "RECOMMENDED_PRICE": best_price,
+        "ANCHOR_PRICE": float(anchor),
+        "BASE_PRICE": float(r["BASE_PRICE"]),
+    })
 
-    if candidates.size > 1 and np.random.rand() < EXPLORATION_EPS:
-        idx = np.random.randint(int(candidates.size))
-        return float(candidates[idx]), {"reason": "epsilon_explore", "profit_est": float(profits[idx])}
-
-    ctx_cols = [
-        "IS_PROMO_NOW", "ONLINE_SHARE", "VOLATILITY_QTY_4W",
-        "FAM_SALE_QTY", "CAT_SALE_QTY", "SEG_SALE_QTY", "REG_SALE_QTY", "STT_SALE_QTY",
-        "ELAST1", "ELAST4", "AGE_WEEKS", "RISK_OOS"
-    ]
-    ctx = np.array([row.get(c, 0.0) for c in ctx_cols], dtype=float)
-
-    ctx_matrix = np.vstack([ctx] * int(candidates.size))
-    action_matrix = np.vstack([action_vector_from_price(p, base_price) for p in candidates])
-
-    if ctx_matrix.shape[0] == 0 or action_matrix.shape[0] == 0:
-        idx = int(np.argmax(profits))
-        return float(candidates[idx]), {"reason": "greedy_fallback_n0", "profit_est": float(profits[idx])}
-
-    idx = bandit.select(group_id, ctx_matrix, action_matrix)
-    if idx is None or idx < 0 or idx >= candidates.size:
-        idx = int(np.argmax(profits))
-        return float(candidates[idx]), {"reason": "greedy_fallback_idx", "profit_est": float(profits[idx])}
-
-    chosen = float(candidates[idx])
-    return chosen, {
-        "reason": "linucb",
-        "profit_est": float(profits[idx]),
-        "all_profit_est": profits.tolist()
-    }
-
-
-# ============================================
-# Оценка и предсказание
-# ============================================
-
-def walk_forward_eval(weekly_df, weeks_sorted, horizon_eval=12):
-    pipe, _ = build_demand_model()
-    bandit = LinUCB(alpha=1.0)
-    results = []
-    last_prices = {}
-
-    for i in range(horizon_eval, len(weeks_sorted)):
-        train_weeks = weeks_sorted[i - horizon_eval: i]
-        pred_week = weeks_sorted[i]
-
-        train_data = weekly_df[weekly_df["WEEK_ID"].isin(train_weeks)].copy()
-        pipe = fit_demand_model(pipe, train_data)
-
-        pred_rows = weekly_df[weekly_df["WEEK_ID"] == pred_week].copy()
-        pred_rows = pred_rows.sort_values(["STORE", "PRODUCT_CODE", "BUCKET"])
-
-        week_chosen = []
-        for _, row in pred_rows.iterrows():
-            key_lp = (row["STORE"], row["PRODUCT_CODE"], row["BUCKET"])
-            last_price = last_prices.get(key_lp, row["BASE_PRICE"])
-            group_id = f"{row['STORE']}|{row['SEGMENT_CODE']}|{row['BUCKET']}"
-
-            chosen_price, info = choose_price_for_row(row, pipe, bandit, last_price, group_id)
-            if not pd.isna(chosen_price):
-                last_prices[key_lp] = chosen_price
-
-            profit_hat = info.get("profit_est", 0.0)
-            reward = profit_hat / (1.0 + abs(profit_hat))
-
-            ctx_cols = [
-                "IS_PROMO_NOW", "ONLINE_SHARE", "VOLATILITY_QTY_4W",
-                "FAM_SALE_QTY", "CAT_SALE_QTY", "SEG_SALE_QTY", "REG_SALE_QTY", "STT_SALE_QTY",
-                "ELAST1", "ELAST4", "AGE_WEEKS", "RISK_OOS"
-            ]
-            ctx = np.array([row.get(c, 0.0) for c in ctx_cols], dtype=float)
-            act = action_vector_from_price(chosen_price, row["BASE_PRICE"])
-            x = np.concatenate([ctx, act])
-            bandit.update(group_id, x, reward)
-
-            week_chosen.append({
-                "STORE": row["STORE"],
-                "PRODUCT_CODE": row["PRODUCT_CODE"],
-                "BUCKET": row["BUCKET"],
-                "WEEK_ID": pred_week,
-                "CHOSEN_PRICE": chosen_price,
-                "REASON": info.get("reason", "na"),
-                "PROFIT_EST": profit_hat
-            })
-
-        if week_chosen:
-            results.append(pd.DataFrame(week_chosen))
-
-    if len(results) == 0:
-        return pd.DataFrame()
-    return pd.concat(results, ignore_index=True)
-
-
-# ---- Drop-in replacement for predict_next_week_prices ----
-
-def predict_next_week_prices(weekly_df, next_week_id, raw_df=None):
-    # If raw_df is provided and the target week is absent, create it on the fly
-    if (weekly_df["WEEK_ID"] == next_week_id).sum() == 0:
-        if raw_df is None:
-            raise ValueError("next_week_id отсутствует в weekly_df (передайте raw_df или сначала создайте шаблон строк на неделю).")
-        weekly_df = ensure_future_week_in_weekly_df(raw_df, weekly_df, next_week_id)
-        if (weekly_df["WEEK_ID"] == next_week_id).sum() == 0:
-            raise ValueError("Не удалось создать шаблон строк на неделю (нет истории для базовых цен).")
-
-    all_weeks = sorted(weekly_df["WEEK_ID"].unique())
-    idx = all_weeks.index(next_week_id)
-    if idx < 12:
-        raise ValueError("Недостаточно истории (<12 недель) для обучения.")
-
-    # Train demand model on last 12 weeks prior to target
-    train_weeks = all_weeks[idx - 12: idx]
-    pipe, _ = build_demand_model()
-    bandit = LinUCB(alpha=1.0)
-
-    train_data = weekly_df[weekly_df["WEEK_ID"].isin(train_weeks)].copy()
-    pipe = fit_demand_model(pipe, train_data)
-
-    # Previous-week prices map (same bucket)
-    prev_week_id = all_weeks[idx - 1]
-    prev_df = weekly_df[weekly_df["WEEK_ID"] == prev_week_id][
-        ["STORE", "PRODUCT_CODE", "BUCKET", "SALE_PRICE", "BASE_PRICE"]
-    ].copy()
-    prev_df = prev_df.rename(columns={"SALE_PRICE": "LAST_SALE_PRICE"})
-    prev_key = list(zip(prev_df["STORE"], prev_df["PRODUCT_CODE"], prev_df["BUCKET"]))
-    prev_map = {k: p for k, p in zip(prev_key, prev_df["LAST_SALE_PRICE"])}
-
-    # Target rows
-    pred_rows = weekly_df[weekly_df["WEEK_ID"] == next_week_id].copy()
-    pred_rows = pred_rows.sort_values(["STORE", "PRODUCT_CODE", "BUCKET"])
-
-    recommendations = []
-    for _, row in pred_rows.iterrows():
-        key_lp = (row["STORE"], row["PRODUCT_CODE"], row["BUCKET"])
-        last_price = prev_map.get(key_lp, row["BASE_PRICE"])
-        group_id = f"{row['STORE']}|{row['SEGMENT_CODE']}|{row['BUCKET']}"
-        price, info = choose_price_for_row(row, pipe, bandit, last_price, group_id)
-        recommendations.append({
-            "STORE": row["STORE"],
-            "PRODUCT_CODE": row["PRODUCT_CODE"],
-            "BUCKET": row["BUCKET"],
-            "WEEK_ID": next_week_id,
-            "RECOMMENDED_PRICE": price,
-            "BASE_PRICE": row["BASE_PRICE"],
-            "LAST_PRICE_PREV_WEEK": last_price,
-            "REASON": info.get("reason", "na"),
-            "PROFIT_EST": info.get("profit_est", np.nan)
-        })
-
-    return pd.DataFrame(recommendations)
-
-
-
-# ============================================
-# Рантайм-логика «запуск по дням Mon/Fri/Sat»
-# ============================================
-
-def build_weekly_df_with_future(raw_df, run_date):
-    # Собираем weekly_df из истории + добавляем пустые строки на неделю run_date (Mon..Sun)
-    df_hist = prepare_raw(raw_df)
-    wk_hist = weekly_aggregates(df_hist)
-
-    monday = week_start_monday(pd.Timestamp(run_date))
-    fut = create_future_week_template(raw_df, monday)
-
-    if fut.empty:
-        return wk_hist  # нечего добавлять
-
-    # Склеиваем, пересчитываем фичи уже на объединении, чтобы у будущей недели появились лаги/иерархии
-    combined = pd.concat([df_hist, fut.assign(TRADE_DT=monday)], ignore_index=True, sort=False)
-    combined = prepare_raw(combined)  # восстановим WEEK_ID/BUCKET и т.д. для новых строк
-    weekly = weekly_aggregates(combined)
-    return weekly
-
-
-def bucket_for_run_date(run_date):
-    wd = pd.Timestamp(run_date).weekday()
-    if wd == 0:
-        return "Mon-Thu"
-    if wd == 4:
-        return "Fri"
-    if wd == 5:
-        return "Sat-Sun"
-    raise ValueError("Код должен запускаться только в понедельник, пятницу или субботу.")
-
-def recommend_for_run_date(raw_df, run_date):
-    weekly_df = build_weekly_df_with_future(raw_df, run_date)
-    target_week = week_id(week_start_monday(pd.Timestamp(run_date)))
-    full_week_reco = predict_next_week_prices(weekly_df, target_week, raw_df=raw_df)
-    target_bucket = bucket_for_run_date(run_date)
-    return weekly_df, full_week_reco[full_week_reco["BUCKET"] == target_bucket].reset_index(drop=True)
-
-
-
-# ============================================
-# Пример использования
-# ============================================
-
-if __name__ == "__main__":
-    # Заготовка структуры входа: Замените на вашу загрузку DWH/CSV
-    cols = [
-        "TRADE_DT", "IS_PROMO", "SALE_PRICE", "SALE_PRICE_ONLINE",
-        "SALE_QTY", "SALE_QTY_ONLINE", "LOSS_QTY", "RETURN_QTY", "DELIVERY_QTY",
-        "START_STOCK", "END_STOCK", "PRODUCT_CODE", "FAMILY_CODE", "CATEGORY_CODE",
-        "SEGMENT_CODE", "STORE", "STORE_TYPE", "REGION_NAME", "BASE_PRICE",
-        "PROMO_PERIOD", "PLACE_TYPE"
-    ]
-    raw_df = pd.DataFrame(columns=cols)
-
-    # Пример: запускать только в Mon/Fri/Sat
-    # run_date = "2025-09-08"  # Понедельник → Mon-Thu
-    # run_date = "2025-09-12"  # Пятница → Fri
-    # run_date = "2025-09-13"  # Суббота → Sat-Sun
-    # weekly_df, reco = recommend_for_run_date(raw_df, run_date)
-    # print(weekly_df.head())
-    # print(reco.head())
-    pass
+recs_df = pd.DataFrame(recs).sort_values(["STORE","PRODUCT_CODE"]).reset_index(drop=True)
+print("Рекомендации на следующую корзину:", target_bucket)
+recs_df.head(20)
