@@ -48,7 +48,7 @@ END_OF_HISTORY = pd.Timestamp("2025-09-15")
 
 # --- Add these helpers near ARM_GRID ---
 
-def price_to_multiplier(price, base_price):
+ef price_to_multiplier(price, base_price):
     # аккуратно обрабатываем нули/NaN
     if pd.isna(price) or pd.isna(base_price) or base_price <= 0:
         return np.nan
