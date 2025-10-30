@@ -130,27 +130,68 @@ def prepare(df):
 # ----------------------------
 # Demand model (CatBoost)
 # ----------------------------
+# Replace train_demand_model()
 def train_demand_model(hist):
-    # Use only rows with positive observations to reduce noise
     use = hist.copy()
+
+    # Fixed categorical list (use only those that exist)
+    cat_cols_all = ["STORE","PRODUCT_CODE","BUCKET_KIND","FAMILY_CODE","CATEGORY_CODE","SEGMENT_CODE"]
+    cat_cols = [c for c in cat_cols_all if c in use.columns]
+
+    # Candidate numeric columns we expect to use
+    num_candidates = [
+        "PRICE","BASE_PRICE","COST_PRICE","AVAIL_STOCK","IS_PROMO_ACTIVE",
+        # lags / MAs (may or may not exist yet)
+        "QTY_L1","QTY_MA4","QTY_MA12",
+        "PRICE_L1","PRICE_MA4","PRICE_MA12",
+        "AVAIL_STOCK_L1","AVAIL_STOCK_MA4","AVAIL_STOCK_MA12"
+    ]
+    # plus any _L1/_MA4/_MA12 that were created beyond the above
+    extra_lag_ma = [c for c in use.columns if any(c.endswith(suf) for suf in ["_L1","_MA4","_MA12"])]
+    # keep unique order and only those present in data
+    seen = set()
+    num_cols = []
+    for c in num_candidates + extra_lag_ma:
+        if c in use.columns and c not in seen and c not in ["QTY","WEEK_START","BUCKET_START"]:
+            num_cols.append(c); seen.add(c)
+
     y = use["QTY"].astype(float).values
-    cat_cols = [c for c in ["STORE","PRODUCT_CODE","BUCKET_KIND","FAMILY_CODE","CATEGORY_CODE","SEGMENT_CODE"] if c in use.columns]
-    num_cols = [c for c in use.columns if c not in ["QTY","WEEK_START"] + cat_cols]
-    X = use[cat_cols+num_cols]
+    X = use[cat_cols + num_cols].copy()
 
     model = CatBoostRegressor(
         depth=6, learning_rate=0.08, n_estimators=400,
-        random_seed=CONFIG["random_state"],
-        loss_function="RMSE", verbose=False
+        random_seed=CONFIG["random_state"], loss_function="RMSE", verbose=False
     )
     train_pool = Pool(X, y, cat_features=list(range(len(cat_cols))))
     model.fit(train_pool)
     return model, cat_cols, num_cols
 
+# Replace predict_qty()
 def predict_qty(model, cat_cols, num_cols, dfX):
-    pool = Pool(dfX[cat_cols+num_cols], cat_features=list(range(len(cat_cols))))
+    X = dfX.copy()
+
+    # Add any missing columns with safe defaults
+    for c in cat_cols:
+        if c not in X.columns:
+            X[c] = "NA"
+
+    for c in num_cols:
+        if c not in X.columns:
+            # sensible defaults
+            if c == "IS_PROMO_ACTIVE":
+                X[c] = 0
+            elif c in ("PRICE","BASE_PRICE","COST_PRICE"):
+                X[c] = np.nan  # will be filled per-candidate or left NaN (CatBoost can handle)
+            else:
+                X[c] = np.nan
+
+    # Keep column order consistent
+    X = X[cat_cols + num_cols]
+    pool = Pool(X, cat_features=list(range(len(cat_cols))))
     pred = model.predict(pool)
     return np.maximum(pred, 0.0)
+
+
 
 # ----------------------------
 # Contextual bandit policy (per (STORE, SKU, BUCKET))
@@ -261,58 +302,60 @@ def rolling_eval(agg, bucket_kind, end_bucket_start, weeks=12):
 # ----------------------------
 # One-shot recommendation for a chosen bucket (using info strictly before bucket start)
 # ----------------------------
+# Replace build_bucket_snapshot()
 def build_bucket_snapshot(agg, bucket_kind, bucket_start):
-    """
-    Returns a frame for (STORE, PRODUCT_CODE) active before bucket_start.
-    Prefers actual agg rows for this bucket; otherwise fills from last-seen history.
-    """
     week_start = week_monday(bucket_start)
-    # actual rows for this bucket (if any)
+
+    # Actual rows for this bucket (if any)
     cur = agg[(agg["BUCKET_KIND"] == bucket_kind) & (agg["BUCKET_START"] == bucket_start)].copy()
 
-    # keys active before target
     hist = agg[agg["BUCKET_START"] < bucket_start]
     if hist.empty:
-        return cur  # nothing we can infer
+        return cur  # nothing to synthesize from
 
     last = (hist.sort_values("BUCKET_START")
-                 .groupby(["STORE","PRODUCT_CODE"]).tail(1)
-                 .copy())
+                 .groupby(["STORE","PRODUCT_CODE"]).tail(1).copy())
 
-    # minimal skeleton
     skel = last[["STORE","PRODUCT_CODE"]].drop_duplicates().copy()
     skel["WEEK_START"]   = week_start
-    skel["BUCKET_START"] = bucket_start
+    skel["BUCKET_START"] = pd.to_datetime(bucket_start).normalize()
     skel["BUCKET_KIND"]  = bucket_kind
 
-    # bring last-known numeric fields
-    keep_cols = ["BASE_PRICE","COST_PRICE","PRICE","AVAIL_STOCK","START_STOCK",
-                 "END_STOCK","DELIVERY_QTY","QTY","FAMILY_CODE","CATEGORY_CODE","SEGMENT_CODE"]
+    # Bring last-known basics
+    keep_cols = [
+        "BASE_PRICE","COST_PRICE","PRICE","AVAIL_STOCK","START_STOCK","END_STOCK",
+        "DELIVERY_QTY","QTY","IS_PROMO_ACTIVE","FAMILY_CODE","CATEGORY_CODE","SEGMENT_CODE"
+    ]
+    # Also bring over any lag/MA columns present in history
+    lag_ma_cols = [c for c in hist.columns if any(c.endswith(suf) for suf in ["_L1","_MA4","_MA12"])]
+    keep_cols += lag_ma_cols
+
     for c in keep_cols:
         if c in last.columns:
             skel = skel.merge(last[["STORE","PRODUCT_CODE",c]], on=["STORE","PRODUCT_CODE"], how="left")
 
-    # rename last PRICE to LAST_PRICE; ensure BASE/COST exist
+    # LAST_PRICE and defaults
     if "PRICE" in skel.columns:
         skel.rename(columns={"PRICE":"LAST_PRICE"}, inplace=True)
     if "BASE_PRICE" not in skel.columns: skel["BASE_PRICE"] = np.nan
     if "COST_PRICE" not in skel.columns: skel["COST_PRICE"] = np.nan
+    if "IS_PROMO_ACTIVE" not in skel.columns: skel["IS_PROMO_ACTIVE"] = 0
 
-    # prefer actual rows if they exist; combine
     if not cur.empty:
-        # attach LAST_PRICE to current via last
         cur = cur.merge(skel[["STORE","PRODUCT_CODE","LAST_PRICE"]], on=["STORE","PRODUCT_CODE"], how="left")
         snap = cur
     else:
-        # when no actual rows: create pseudo-agg row for the bucket
         snap = skel.copy()
-        snap["QTY"] = 0.0
+        snap["QTY"] = snap.get("QTY", 0).fillna(0.0)
         # AVAIL_STOCK fallback if missing
         if "AVAIL_STOCK" not in snap.columns or snap["AVAIL_STOCK"].isna().all():
-            snap["AVAIL_STOCK"] = np.maximum(snap.get("START_STOCK", 0).fillna(0)
-                                             + snap.get("DELIVERY_QTY", 0).fillna(0)
-                                             - snap.get("QTY", 0).fillna(0), 0)
+            snap["AVAIL_STOCK"] = np.maximum(
+                snap.get("START_STOCK", 0).fillna(0)
+                + snap.get("DELIVERY_QTY", 0).fillna(0)
+                - snap.get("QTY", 0).fillna(0), 0
+            )
     return snap
+
 
 
 def recommend_for_bucket(agg, bucket_kind, bucket_start):
