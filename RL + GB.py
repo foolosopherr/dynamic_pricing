@@ -69,7 +69,6 @@ def prepare(df):
         if pd.isna(s): return (pd.NaT, pd.NaT)
         try:
             a,b = [x.strip() for x in str(s).split("-")]
-            # string may be like "01-01-2024 " and " 03-01-2024"
             a = pd.to_datetime(a, dayfirst=True, errors="coerce")
             b = pd.to_datetime(b, dayfirst=True, errors="coerce")
             return (a, b)
@@ -80,16 +79,15 @@ def prepare(df):
     df["PROMO_END"]   = [x[1] for x in promo]
     df["IS_PROMO_ACTIVE"] = (df["TRADE_DT"]>=df["PROMO_START"]) & (df["TRADE_DT"]<=df["PROMO_END"])
 
-    # Fill missing stock-related fields
-    for c in ["START_STOCK","END_STOCK","DELIVERY_QTY","LOSS_QTY","RETURN_QTY","SALE_QTY","SALE_PRICE","BASE_PRICE"]:
+    for c in ["START_STOCK","END_STOCK","DELIVERY_QTY","LOSS_QTY","RETURN_QTY",
+              "SALE_QTY","SALE_PRICE","BASE_PRICE"]:
         if c in df.columns:
             df[c] = df[c].fillna(0)
 
-    # Approximate cost if absent
     if "COST_PRICE" not in df.columns:
-        df["COST_PRICE"] = np.maximum(df["BASE_PRICE"]*(1-0.75), 0)  # assume 25% baseline margin; adjust if known
+        df["COST_PRICE"] = np.maximum(df["BASE_PRICE"]*(1-0.75), 0)  # fallback
 
-    # Daily to bucket aggregates (per store, SKU)
+    # Daily → bucket aggregates
     agg = (df.groupby(["STORE","PRODUCT_CODE","WEEK_START","BUCKET_KIND"], as_index=False)
              .agg({
                  "SALE_QTY":"sum",
@@ -102,22 +100,31 @@ def prepare(df):
                  "IS_PROMO_ACTIVE":"max"
              }))
     agg.rename(columns={"SALE_QTY":"QTY","SALE_PRICE":"PRICE"}, inplace=True)
-    # simple stock availability proxy
+
+    # BUCKET_START actual date (Mon..Sun depending on kind)
+    bs = []
+    for _, r in agg.iterrows():
+        s, _ = bucket_bounds(r["WEEK_START"], r["BUCKET_KIND"])
+        bs.append(pd.to_datetime(s).normalize())
+    agg["BUCKET_START"] = pd.to_datetime(bs)
+
+    # availability proxy
     agg["AVAIL_STOCK"] = np.maximum(agg["START_STOCK"] + agg["DELIVERY_QTY"] - np.maximum(agg["QTY"],0), 0)
 
-    # Lag features (last 12 weeks per SKU-store-bucket)
-    agg = agg.sort_values(["STORE","PRODUCT_CODE","WEEK_START","BUCKET_KIND"])
+    # Sort & lags (within SKU×STORE×BUCKET_KIND for behavior; keep also cross-bucket info via MA12 over all buckets if desired)
+    agg = agg.sort_values(["STORE","PRODUCT_CODE","BUCKET_START","BUCKET_KIND"])
     grp = agg.groupby(["STORE","PRODUCT_CODE","BUCKET_KIND"], group_keys=False)
     for col in ["QTY","PRICE","AVAIL_STOCK"]:
         agg[f"{col}_L1"]  = grp[col].shift(1)
         agg[f"{col}_MA4"] = grp[col].rolling(4, min_periods=1).mean().reset_index(level=[0,1,2], drop=True)
         agg[f"{col}_MA12"]= grp[col].rolling(12, min_periods=1).mean().reset_index(level=[0,1,2], drop=True)
 
-    # Hierarchical aggregates (share information)
+    # Attach hierarchy from raw df (first available per group)
     for lvl in CONFIG["hier_levels"]:
         if lvl in df.columns:
             map_lvl = df.groupby(["STORE","PRODUCT_CODE","WEEK_START","BUCKET_KIND"], as_index=False)[lvl].first()
             agg = agg.merge(map_lvl, on=["STORE","PRODUCT_CODE","WEEK_START","BUCKET_KIND"], how="left")
+
     return agg
 
 # ----------------------------
@@ -196,124 +203,119 @@ def select_arm(row, last_price, last_arm, model, cat_cols, num_cols):
 # ----------------------------
 # Rolling evaluation (12 weeks)
 # ----------------------------
-def rolling_eval(agg, bucket_kind, end_week_start, weeks=12):
+def rolling_eval(agg, bucket_kind, end_bucket_start, weeks=12):
     """
-    Evaluate policy for the last `weeks` buckets of type `bucket_kind` ending before `end_week_start`.
-    Uses model trained only on data strictly before each evaluated bucket.
-    Returns dataframe with simulated profits for policy vs baseline.
+    Evaluate for last `weeks` occurrences of `bucket_kind` with end strictly before `end_bucket_start`.
+    For each evaluation bucket, the demand model is trained on **all buckets** with BUCKET_START < target_start.
     """
     out = []
-    # sequence of bucket week_starts to evaluate
-    wk_list = (agg.query("BUCKET_KIND == @bucket_kind and WEEK_START < @end_week_start")
-                 .WEEK_START.drop_duplicates().sort_values())[-weeks:]
 
-    for wk in wk_list:
-        # train window: all data strictly before this bucket
-        train_hist = agg[(agg["WEEK_START"] < wk) & (agg["BUCKET_KIND"] == bucket_kind)]
+    # buckets of this kind before end_bucket_start
+    to_eval = (agg.query("BUCKET_KIND == @bucket_kind and BUCKET_START < @end_bucket_start")
+                 .drop_duplicates(subset=["WEEK_START","BUCKET_KIND"])
+                 .sort_values("BUCKET_START"))[-weeks:]
 
-        # Cold-start: if too few rows, back off to hierarchy by dropping PRODUCT_CODE for CatBoost (handled implicitly)
+    for _, r in to_eval.iterrows():
+        target_start = r["BUCKET_START"]
+
+        # TRAIN = all buckets strictly before target_start
+        train_hist = agg[agg["BUCKET_START"] < target_start]
         if len(train_hist) < 50:
             continue
 
         model, cat_cols, num_cols = train_demand_model(train_hist)
 
-        cur = agg[(agg["WEEK_START"] == wk) & (agg["BUCKET_KIND"] == bucket_kind)].copy()
-        # last realized signals
-        cur = cur.sort_values(["STORE","PRODUCT_CODE"])
-        # build index to fetch last price & arm (approx from last week)
-        prev = agg[(agg["WEEK_START"] < wk) & (agg["BUCKET_KIND"] == bucket_kind)]
-        prev_last = (prev.sort_values("WEEK_START")
-                          .groupby(["STORE","PRODUCT_CODE"]).tail(1)[["STORE","PRODUCT_CODE","PRICE"]]
-                          .rename(columns={"PRICE":"LAST_PRICE"}))
-        cur = cur.merge(prev_last, on=["STORE","PRODUCT_CODE"], how="left")
+        cur = agg[(agg["BUCKET_KIND"] == bucket_kind) & (agg["BUCKET_START"] == target_start)].copy()
 
-        # last arm approximate from ratio to base
+        # last realized price from ANY previous bucket
+        prev = agg[agg["BUCKET_START"] < target_start].sort_values("BUCKET_START")
+        prev_last = (prev.groupby(["STORE","PRODUCT_CODE"]).tail(1)[["STORE","PRODUCT_CODE","PRICE"]]
+                         .rename(columns={"PRICE":"LAST_PRICE"}))
+        cur = cur.merge(prev_last, on=["STORE","PRODUCT_CODE"], how="left")
         cur["LAST_ARM"] = (cur["LAST_PRICE"] / cur["BASE_PRICE"]).round(2)
 
         recs = []
-        for i, row in cur.iterrows():
+        for _, row in cur.iterrows():
             arm, price, prof = select_arm(row, row.get("LAST_PRICE", np.nan), row.get("LAST_ARM", np.nan),
                                           model, cat_cols, num_cols)
             recs.append((arm, price, prof))
         cur["REC_ARM"], cur["REC_PRICE"], cur["REC_PROFIT_SIM"] = zip(*recs)
 
-        # Baseline: keep last price (or base price)
+        # Baseline: keep last price (or base)
         cur["BASELINE_PRICE"] = np.where(cur["LAST_PRICE"].notna(), cur["LAST_PRICE"], cur["BASE_PRICE"])
-        # Simulate baseline demand (use model)
         baseX = cur.copy()
         baseX["PRICE"] = baseX["BASELINE_PRICE"]
         base_qty = predict_qty(model, cat_cols, num_cols, baseX)
         base_served = np.minimum(base_qty, np.maximum(cur["AVAIL_STOCK"],0))
         cur["BASELINE_PROFIT_SIM"] = (baseX["PRICE"] - baseX["COST_PRICE"]) * base_served
 
-        # KPI
         cur["UPLIFT_SIM"] = cur["REC_PROFIT_SIM"] - cur["BASELINE_PROFIT_SIM"]
-        cur["WEEK_START_EVAL"] = wk
-        out.append(cur[["STORE","PRODUCT_CODE","BUCKET_KIND","WEEK_START_EVAL",
+        cur["WEEK_START_EVAL"] = cur["WEEK_START"]
+        cur["BUCKET_START_EVAL"] = target_start
+
+        out.append(cur[["STORE","PRODUCT_CODE","BUCKET_KIND","WEEK_START_EVAL","BUCKET_START_EVAL",
                         "REC_ARM","REC_PRICE","REC_PROFIT_SIM",
                         "BASELINE_PRICE","BASELINE_PROFIT_SIM","UPLIFT_SIM"]])
 
     if not out:
         return pd.DataFrame()
     res = pd.concat(out, ignore_index=True)
-    kpi = (res.groupby("WEEK_START_EVAL", as_index=False)
+    kpi = (res.groupby("BUCKET_START_EVAL", as_index=False)
               .agg({"REC_PROFIT_SIM":"sum","BASELINE_PROFIT_SIM":"sum","UPLIFT_SIM":"sum"}))
     kpi["UPLIFT_%"] = 100 * (kpi["UPLIFT_SIM"] / np.maximum(kpi["BASELINE_PROFIT_SIM"],1e-6))
     return res, kpi
 
+
 # ----------------------------
 # One-shot recommendation for a chosen bucket (using info strictly before bucket start)
 # ----------------------------
-def recommend_for_bucket(agg, bucket_kind, week_start):
-    # Train model on history strictly before target bucket
-    train_hist = agg[(agg["WEEK_START"] < week_start) & (agg["BUCKET_KIND"] == bucket_kind)]
+def recommend_for_bucket(agg, bucket_kind, bucket_start):
+    # Train model on ALL buckets strictly before this bucket start
+    train_hist = agg[agg["BUCKET_START"] < bucket_start]
     if len(train_hist) < 50:
-        raise ValueError("Not enough history for training. Reduce constraints or provide more data.")
+        raise ValueError("Not enough history for training. Provide more data or relax filters.")
     model, cat_cols, num_cols = train_demand_model(train_hist)
 
-    cur = agg[(agg["WEEK_START"] == week_start) & (agg["BUCKET_KIND"] == bucket_kind)].copy()
-    prev = agg[(agg["WEEK_START"] < week_start) & (agg["BUCKET_KIND"] == bucket_kind)]
-    prev_last = (prev.sort_values("WEEK_START")
-                      .groupby(["STORE","PRODUCT_CODE"]).tail(1)[["STORE","PRODUCT_CODE","PRICE"]]
-                      .rename(columns={"PRICE":"LAST_PRICE"}))
+    cur = agg[(agg["BUCKET_KIND"] == bucket_kind) & (agg["BUCKET_START"] == bucket_start)].copy()
+
+    # last realized price from ANY earlier bucket
+    prev = agg[agg["BUCKET_START"] < bucket_start].sort_values("BUCKET_START")
+    prev_last = (prev.groupby(["STORE","PRODUCT_CODE"]).tail(1)[["STORE","PRODUCT_CODE","PRICE"]]
+                     .rename(columns={"PRICE":"LAST_PRICE"}))
     cur = cur.merge(prev_last, on=["STORE","PRODUCT_CODE"], how="left")
     cur["LAST_ARM"] = (cur["LAST_PRICE"] / cur["BASE_PRICE"]).round(2)
 
     recs = []
-    for i, row in cur.iterrows():
+    for _, row in cur.iterrows():
         arm, price, prof = select_arm(row, row.get("LAST_PRICE", np.nan), row.get("LAST_ARM", np.nan),
                                       model, cat_cols, num_cols)
         recs.append((arm, price, prof))
     cur["REC_ARM"], cur["REC_PRICE"], cur["REC_PROFIT_SIM"] = zip(*recs)
 
-    return cur[["STORE","PRODUCT_CODE","BUCKET_KIND","WEEK_START","BASE_PRICE","LAST_PRICE","REC_ARM","REC_PRICE","REC_PROFIT_SIM"]]
+    return cur[["STORE","PRODUCT_CODE","BUCKET_KIND","WEEK_START","BUCKET_START",
+                "BASE_PRICE","LAST_PRICE","REC_ARM","REC_PRICE","REC_PROFIT_SIM"]]
 
 # ----------------------------
 # Orchestration: run for 3 buckets & evaluate
 # ----------------------------
-def run_all(df, chosen_week_start_str):
+ddef run_for_run_date(df, run_date_str):
     """
-    chosen_week_start_str: any date string inside the target week; it will be snapped to Monday.
-    Produces:
-      - recommendations for Mon-Thu, Fri, Sat-Sun buckets for that week
-      - 12-week rolling evaluation up to each bucket start
+    Run the pipeline for a specific calendar date that is guaranteed to be Mon, Fri or Sat.
+    Uses ALL history strictly before the start of that bucket (so Fri sees Mon–Thu; Sat–Sun sees Fri).
+    Returns: {"rec": recommendation_df, "eval": (eval_items_df, eval_kpi_df)}
     """
     agg = prepare(df)
-    week_start = week_monday(pd.to_datetime(chosen_week_start_str))
+    run_date = pd.to_datetime(run_date_str).normalize()
 
-    outputs = {}
-    for bucket_kind in ["Mon-Thu","Fri","Sat-Sun"]:
-        b_start, _ = bucket_bounds(week_start, bucket_kind)
+    # determine bucket by actual date
+    bucket_kind = which_bucket(run_date)
+    # bucket start is the same calendar date for Fri and Sat, or Monday for Mon-Thu
+    week_start = week_monday(run_date)
+    bucket_start, _ = bucket_bounds(week_start, bucket_kind)
 
-        # evaluation uses last 12 occurrences of this bucket, ending before b_start
-        eval_res = rolling_eval(agg, bucket_kind, b_start, weeks=CONFIG["eval_weeks"])
-        outputs[f"eval_{bucket_kind}"] = eval_res
-
-        # recommendation for the chosen bucket
-        rec = recommend_for_bucket(agg, bucket_kind, b_start)
-        outputs[f"rec_{bucket_kind}"] = rec
-
-    return outputs
+    eval_res = rolling_eval(agg, bucket_kind, bucket_start, weeks=CONFIG["eval_weeks"])
+    rec = recommend_for_bucket(agg, bucket_kind, bucket_start)
+    return {"bucket_kind": bucket_kind, "bucket_start": bucket_start, "rec": rec, "eval": eval_res}
 
 # ----------------------------
 # Usage:
