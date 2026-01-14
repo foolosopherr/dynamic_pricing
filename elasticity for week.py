@@ -1,24 +1,80 @@
-# Основные требования:
-# 1) Товары появляются/исчезают, строки с 0 продаж есть (панель).
-# 2) Иерархия: PRODUCT -> FAMILY -> CATEGORY -> SEGMENT
-# 3) Конец истории: 2025-09-15 (HISTORY_END)
-# 4) Цены меняются только между бакетами MON_THU / FRI / SAT_SUN
-# 5) Rolling оценка последние 12 недель (есть функция backtest)
-# 7) "правильный" cutoff для бакета: MON_THU=вс прошлой недели, FRI=чт, SAT_SUN=пт
-#    Но в понедельник мы НЕ видим будущие дни => cutoff_effective = min(rule_cutoff, as_of_date)
-# 8) PROMO_PERIOD строка "01-01-2024 - 03-01-2024"
-#
-# Важно про "явную эластичность":
-# - Модель: log(E[Q]) = ... + beta * log(P) + ...
-# - При StandardScaler коэффициенты в масштабе z-score.
-# - Эластичность в исходных единицах:
-#       beta_raw = beta_scaled / std(log(P))
-# - Для cross: gamma_raw = coef_scaled[j] / std(log(P_j))
+"""
+Пайплайн работы кода
+
+1) preprocess_raw(df_raw)
+   - Приводим TRADE_DT к дате (normalize), режем историю по HISTORY_END.
+   - Складываем продажи оффлайн+онлайн в QTY_TOTAL (важно: строки могут существовать даже при Q=0).
+   - Восстанавливаем UNIT_PRICE (если SALE_PRICE нет, считаем из total/qty).
+   - Считаем BUCKET по дню недели (Mon-Thu / Fri / Sat-Sun).
+   - Парсим PROMO_PERIOD в диапазоны дат (PROMO_RANGE), чтобы потом считать PROMO_SHARE на интервале бакета.
+
+2) aggregate_to_buckets(daily)
+   - Агрегируем дневные строки до уровня "товар-магазин-неделя-бакет".
+   - Получаем QTY (сумма), PRICE (взвешенная по продажам), PROMO_SHARE (доля дней промо в бакете),
+     STOCK_END (остаток на конец бакета) и OOS_FLAG (признак OOS по STOCK_END<=0).
+   - Добавляем сезонность/календарь и тренд:
+     SIN_WOY, COS_WOY (неделя года), TREND_W (линейный тренд по времени),
+     BUCKET_IDX (код бакета).
+
+3) add_lag_features(bucket_df)
+   - Добавляем лаги внутри (SKU, STORE, BUCKET):
+     QTY_L1, PRICE_L1, PROMO_L1, STOCK_END_L1, OOS_L1.
+   - Это закрывает проблему "цена сегодня -> продажи завтра/в следующем бакете".
+   - Также делаем LOW_STOCK_FLAG (по STOCK_END_L1), чтобы модель могла учитывать ограничение спроса.
+
+4) calculate_for_week(..., mode)
+   - Выбираем бакеты для расчёта по режиму запуска:
+     mode="monday": считаем только MON_THU
+     mode="friday": считаем FRI и SAT_SUN
+   - Устанавливаем cutoff (до какой даты можно смотреть факты):
+     monday: cutoff = вс прошлой недели
+     friday: cutoff = чт текущей недели (то есть используем свежие Mon-Thu)
+   - Строим context: последняя доступная запись по SKU+STORE до cutoff.
+
+5) REG_PRICE + промо-правило (ключевое)
+   - Для каждого SKU+STORE+BUCKET считаем BASE_PRICE (последняя цена в этом бакете до cutoff).
+   - Далее считаем REG_PRICE:
+       a) если BASE_PRICE валиден -> REG_PRICE = BASE_PRICE
+       b) иначе -> медиана цен за последние N недель (сначала в этом bucket, потом по любому bucket)
+   - Если PROMO_SHARE > PROMO_THRESHOLD:
+       применяем жёсткий cap: CHOSEN_PRICE <= REG_PRICE
+     (реализовано через "обрезание" grid цен сверху).
+
+6) Обучение моделей эластичности (HierDualModels)
+   - Обучаем PoissonRegressor на y=QTY (сезонность+тренд+OOS+promo+lags+price features).
+   - Делаем "dual" (promo/nonpromo) модели и backoff по иерархии:
+     PRODUCT_STORE -> FAMILY -> CATEGORY -> SEGMENT -> GLOBAL.
+   - Эластичность (приближённо) = коэффициент при LOG_PRICE_L1 (в "сырых" единицах),
+     плюс локальная эластичность вокруг выбранной цены (через +/- delta).
+
+7) Cannibalization (Cross-family) + fallback на single
+   - Для семейства в магазине и бакете берём top-K SKU по продажам и учим cross-модели:
+     y_sku ~ log(price всех sku в top-K) (Poisson).
+   - В оптимизации по семье итеративно подбираем цены, учитывая, что изменение цены одного товара
+     меняет спрос остальных (каннибализация).
+   - Если cross-модель не построилась/не подходит, считаем single-оптимизацию с иерархическим backoff.
+
+8) Оптимизация цены (grid search)
+   - Строим grid цен вокруг anchor (REG_PRICE), с ограничением MIN_MULT..MAX_MULT,
+     дополнительно "snap" к наблюдавшимся ценам семьи (price ladder), чтобы не предлагать странные цены.
+   - Для каждого кандидата предсказываем спрос mu (и ограничиваем stock_cap_end),
+     считаем objective = revenue - penalty (штраф удерживает цену около REG_PRICE),
+     выбираем максимум.
+   - В промо grid уже обрезан, поэтому результат гарантированно не выше REG_PRICE.
+
+9) Выход
+   - Для каждого SKU+STORE+BUCKET отдаём CHOSEN_PRICE, прогноз спроса/выручки,
+     признаки эластичности (OWN_ELASTICITY_*, LOCAL_ELASTICITY), факт использования cross-модели,
+     и диагностические поля REG_PRICE_SOURCE, PROMO_CAP_PRICE и т.д.
+
+Итого: весь код описывает единый продовый пайплайн "подготовка -> агрегация -> лаги -> модели спроса/эластичности
+-> учёт промо и остатков -> оптимизация цены по сетке -> результат по бакетам с нужными cutoff".
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Set
 
 import numpy as np
 import pandas as pd
@@ -27,52 +83,131 @@ from sklearn.preprocessing import StandardScaler
 
 
 # =========================
-# Конфигурация
+# Конфиг
 # =========================
 
+# Горизонт данных и бизнес-ограничения цен
+
+# Дата конца доступной истории. Всё после неё отрезаем, чтобы модель не "видела будущее"
 HISTORY_END = pd.Timestamp("2025-09-15")
 
+# Порядок бакетов (Mon-Thu, Fri, Sat-Sun). Нужен для кодирования BUCKET_IDX
 BUCKET_ORDER = ["MON_THU", "FRI", "SAT_SUN"]
 
-# Ограничения цены
+# Границы мультипликатора цены относительно anchor (REG_PRICE). Вместе задают допустимый диапазон ценовых решений (guardrail бизнес-уровня).
 MIN_MULT = 0.9
-MAX_MULT = 1.3
+MAX_MULT = 1.15
 
-# Poisson GLM
-POISSON_ALPHA = 1e-2          # регуляризация (увеличивайте, если плохо сходится)
+# ------------------------
+
+# Модель спроса (Poisson) и численная устойчивость
+
+# Регуляризация модели PoissonRegressor (L2). Уменьшает переобучение и проблемы с сходимостью
+POISSON_ALPHA = 1e-2
+
+# Максимум итераций оптимизатора. Нужен, чтобы уменьшить ConvergenceWarning на сложных данных
 POISSON_MAX_ITER = 3000
 
-# Backoff shrinkage (на уровне предсказаний)
+# Параметр shrinkage (смешивание уровней иерархии). Чем больше K, тем сильнее тянем к верхнему уровню. Вместе с иерархией даёт устойчивые прогнозы, когда у SKU мало данных.
 DEFAULT_SHRINK_K = 30
 
-# Минимум строк/недель для обучения уровней
-MIN_ROWS_GLOBAL = 500
-MIN_ROWS_SEGMENT = 600
-MIN_ROWS_CATEGORY = 300
-MIN_ROWS_FAMILY = 120
-MIN_ROWS_PRODUCT_STORE = 40
+# ------------------------
 
-# Cross внутри family (каннибализация/кросс-эластичность)
-CROSS_TOP_K = 5               # было 10 -> сильно быстрее и стабильнее
-CROSS_LOOKBACK_WEEKS = 26
-CROSS_MIN_ROWS_PER_SKU = 40
+# Промо-логика и разделение режимов
+
+# Порог, после которого бакет считается "промо" (PROMO_SHARE > threshold).
+#  Используется:
+#    1) для выбора promo/nonpromo модели (dual),
+#    2) для применения промо cap (CHOSEN_PRICE <= REG_PRICE).
+PROMO_THRESHOLD = 0.15
+
+# Минимум строк, чтобы обучать отдельную promo/nonpromo модель.
+# Вместе с PROMO_THRESHOLD определяет, когда мы доверяем раздельным моделям, а когда делаем backoff.
+MIN_ROWS_SPLIT_MODEL = 60
+
+# --------------------------
+
+# Эластичность и guardrails против "всё в максимум"
+
+# Минимально допустимая по модулю отрицательность эластичности (по log-price).
+# Если модель дала слишком слабый или даже положительный наклон, принудительно используем -BETA_FLOOR,
+# чтобы оптимизация не уезжала в MAX_MULT из-за "неэластичного" спроса.
+BETA_FLOOR = 0.7
+
+# Шаг для локальной эластичности вокруг выбранной цены (mu(p*(1±delta))).
+# Нужен, чтобы иметь более интерпретируемую "локальную" эластичность.
+LAMBDA_PRICE_PENALTY = 0.25
+
+# ---------------------------
+
+# Целевая функция (оптимизация)
+
+# Сила штрафа, удерживающего цену возле REG_PRICE.
+# Вместе с MIN_MULT/MAX_MULT определяет "насколько агрессивно" модель двигает цену:
+# - малый штраф => чаще крайние решения,
+# - большой штраф => решения ближе к REG_PRICE.
+LOCAL_ELASTICITY_DELTA = 0.05
+
+# ------------------------------
+
+# Минимумы данных для иерархии
+
+# Минимум строк для глобальной модели по бакету.
+MIN_ROWS_GLOBAL = 600
+
+# Минимум строк для уровня SEGMENT/CATEGORY/FAMILY.
+MIN_ROWS_LEVEL = 120
+
+# Минимум строк для модели PRODUCT_STORE.
+MIN_ROWS_PS = 40
+
+# Минимум наблюдений с QTY>0, чтобы считать эластичность "OK".
+# Вместе эти пороги описывают "когда мы доверяем конкретному уровню" и когда нужно backoff.
+MIN_POS_SALES_FOR_ELAST = 6
+
+# ---------------------------------
+
+# Регулярная цена (REG_PRICE) при пропусках BASE_PRICE
+
+# Сколько недель смотреть назад, чтобы оценить регулярную цену медианой, если BASE_PRICE нет.
+REG_PRICE_MEDIAN_WEEKS = 4
+
+# Минимум точек цены для медианы (иначе медиана ненадёжна).
+# Вместе они описывают safeguard "REG_PRICE как якорь" для промо-cap и построения grid,
+# когда товары появляются/исчезают или в бакете нет недавней цены.
+REG_PRICE_MIN_POINTS = 2
+
+# ----------------------------------
+
+# Каннибализация (cross-family)
+
+# Сколько SKU в семье брать для cross-модели (только самые продаваемые).
+CROSS_TOP_K = 7
+
+# Глубина истории для cross-модели (недели назад)
+CROSS_LOOKBACK_WEEKS = 24
+
+# Минимум строк для обучения модели конкретного SKU внутри family-wide панели.
+CROSS_MIN_ROWS_PER_SKU = 30
+
+# Сколько итераций coordinate-descent при подборе цен в семье (цены влияют друг на друга)
 CROSS_ITERS = 4
 
-# Фильтры для ускорения cross:
-CROSS_MIN_FAMILY_SUM_QTY = 50     # если за lookback в семье мало продаж -> пропускаем cross
-CROSS_MIN_FAMILY_WEEKS = 30       # если мало недель -> пропускаем cross
+# Минимум недель в семье, чтобы вообще строить cross-модель (стабильность).
+CROSS_MIN_FAMILY_WEEKS = 20
+
+# Минимальный суммарный объём продаж семьи, чтобы cross-модель была осмысленной.
+# Вместе эти параметры описывают блок "каннибализация": когда он применяется, на каких SKU,
+# насколько глубоко смотрим историю и как стабильно оптимизируем.
+CROSS_MIN_FAMILY_SUM_QTY = 20
 
 
 # =========================
-# Вспомогательные даты/бакеты
+# Даты / бакеты
 # =========================
 
 def bucket_id_for_date(dt: pd.Timestamp) -> str:
-    """
-    Бакет по дню недели:
-      MON_THU (пн-чт), FRI (пт), SAT_SUN (сб-вс)
-    """
-    wd = pd.Timestamp(dt).weekday()  # Mon=0..Sun=6
+    wd = pd.Timestamp(dt).weekday()
     if wd <= 3:
         return "MON_THU"
     if wd == 4:
@@ -81,13 +216,11 @@ def bucket_id_for_date(dt: pd.Timestamp) -> str:
 
 
 def week_start(dt: pd.Timestamp) -> pd.Timestamp:
-    """Понедельник недели для даты dt."""
     dt = pd.Timestamp(dt).normalize()
     return dt - pd.Timedelta(days=dt.weekday())
 
 
 def bucket_start_end(week_monday: pd.Timestamp, bucket: str) -> Tuple[pd.Timestamp, pd.Timestamp]:
-    """Интервал бакета внутри недели (включительно)."""
     m = pd.Timestamp(week_monday).normalize()
     if bucket == "MON_THU":
         return m, m + pd.Timedelta(days=3)
@@ -96,28 +229,34 @@ def bucket_start_end(week_monday: pd.Timestamp, bucket: str) -> Tuple[pd.Timesta
         return d, d
     if bucket == "SAT_SUN":
         return m + pd.Timedelta(days=5), m + pd.Timedelta(days=6)
-    raise ValueError(f"Unknown bucket={bucket}")
+    raise ValueError(bucket)
 
 
-def decision_cutoff_for_bucket(week_monday: pd.Timestamp, bucket: str) -> pd.Timestamp:
+def decision_cutoff_for_bucket_by_mode(week_monday: pd.Timestamp, bucket: str, mode: str) -> pd.Timestamp:
     """
-    Cutoff по правилу (условие 7):
-      - для MON_THU: воскресенье предыдущей недели
-      - для FRI: четверг текущей недели
-      - для SAT_SUN: пятница текущей недели
+    Прод-логика запуска:
+      - monday morning: считаем MON_THU, cutoff = воскресенье прошлой недели
+      - friday morning: считаем FRI и SAT_SUN на данных Mon-Thu => cutoff = Thu для обоих
     """
+    mode = mode.lower().strip()
     m = pd.Timestamp(week_monday).normalize()
+
+    if mode == "monday":
+        return m - pd.Timedelta(days=1)
+    if mode == "friday":
+        return m + pd.Timedelta(days=3)
+
+    # fallback
     if bucket == "MON_THU":
         return m - pd.Timedelta(days=1)
     if bucket == "FRI":
         return m + pd.Timedelta(days=3)
     if bucket == "SAT_SUN":
         return m + pd.Timedelta(days=4)
-    raise ValueError(f"Unknown bucket={bucket}")
+    raise ValueError(bucket)
 
 
 def _safe_log(x: float) -> float:
-    """Безопасный лог для устойчивости."""
     return float(np.log(max(float(x), 1e-6)))
 
 
@@ -126,9 +265,6 @@ def _safe_log(x: float) -> float:
 # =========================
 
 def parse_promo_period(s: str) -> Optional[Tuple[pd.Timestamp, pd.Timestamp]]:
-    """
-    Парсит PROMO_PERIOD вида "01-01-2024 - 03-01-2024" (dd-mm-yyyy).
-    """
     if not isinstance(s, str) or s.strip() == "" or " - " not in s:
         return None
     a, b = [p.strip() for p in s.split(" - ", 1)]
@@ -145,14 +281,10 @@ def parse_promo_period(s: str) -> Optional[Tuple[pd.Timestamp, pd.Timestamp]]:
 def promo_share_in_range(promo_ranges: List[Tuple[pd.Timestamp, pd.Timestamp]],
                          start: pd.Timestamp,
                          end: pd.Timestamp) -> float:
-    """
-    Доля дней в [start, end], покрытых промо.
-    """
     start = pd.Timestamp(start).normalize()
     end = pd.Timestamp(end).normalize()
     if start > end or not promo_ranges:
         return 0.0
-
     days = pd.date_range(start, end, freq="D")
     mask = np.zeros(len(days), dtype=bool)
     for a, b in promo_ranges:
@@ -165,15 +297,10 @@ def promo_share_in_range(promo_ranges: List[Tuple[pd.Timestamp, pd.Timestamp]],
 
 
 # =========================
-# Препроцессинг дневных данных
+# Preprocess daily
 # =========================
 
 def compute_unit_price(df: pd.DataFrame) -> pd.Series:
-    """
-    Цена за единицу:
-      - если есть SALE_PRICE, используем
-      - иначе SALE_PRICE_TOTAL / max(SALE_QTY,1)
-    """
     if "SALE_PRICE" in df.columns:
         return pd.to_numeric(df["SALE_PRICE"], errors="coerce")
     total = pd.to_numeric(df.get("SALE_PRICE_TOTAL"), errors="coerce")
@@ -182,28 +309,14 @@ def compute_unit_price(df: pd.DataFrame) -> pd.Series:
 
 
 def preprocess_raw(df: pd.DataFrame, history_end: pd.Timestamp = HISTORY_END) -> pd.DataFrame:
-    """
-    Чистим дневные данные:
-      - даты, фильтр <= history_end
-      - QTY_TOTAL
-      - UNIT_PRICE
-      - BUCKET
-      - PROMO_RANGE
-      - нормализация ключей
-      - важный фикс: QTY_TOTAL >= 0 (Poisson требует y>=0)
-    """
     out = df.copy()
-
     out["TRADE_DT"] = pd.to_datetime(out["TRADE_DT"], errors="coerce").dt.normalize()
     out = out.loc[out["TRADE_DT"].notna()]
     out = out.loc[out["TRADE_DT"] <= pd.Timestamp(history_end).normalize()]
 
     qty_off = pd.to_numeric(out.get("SALE_QTY"), errors="coerce").fillna(0.0)
     qty_on = pd.to_numeric(out.get("SALE_QTY_ONLINE"), errors="coerce").fillna(0.0)
-
-    qty_total = (qty_off + qty_on).astype(float)
-    # ФИКС: клипуем неотрицательно (бывают отрицательные коррекции)
-    out["QTY_TOTAL"] = qty_total.clip(lower=0.0)
+    out["QTY_TOTAL"] = (qty_off + qty_on).astype(float).clip(lower=0.0)
 
     out["UNIT_PRICE"] = compute_unit_price(out).astype(float)
     out["BUCKET"] = out["TRADE_DT"].apply(bucket_id_for_date)
@@ -232,7 +345,6 @@ def preprocess_raw(df: pd.DataFrame, history_end: pd.Timestamp = HISTORY_END) ->
 
 
 def build_promo_map(daily: pd.DataFrame) -> Dict[Tuple[str, str], List[Tuple[pd.Timestamp, pd.Timestamp]]]:
-    """Карта промо-интервалов по (PRODUCT_CODE, STORE)."""
     promo_map: Dict[Tuple[str, str], List[Tuple[pd.Timestamp, pd.Timestamp]]] = {}
     if "PROMO_RANGE" not in daily.columns:
         return promo_map
@@ -244,16 +356,10 @@ def build_promo_map(daily: pd.DataFrame) -> Dict[Tuple[str, str], List[Tuple[pd.
 
 
 # =========================
-# Агрегация до бакетов
+# Buckets aggregation
 # =========================
 
 def aggregate_to_buckets(daily: pd.DataFrame) -> pd.DataFrame:
-    """
-    Дневные -> бакет-панель:
-      (PRODUCT, STORE, WEEK, BUCKET) -> QTY, PRICE, PROMO_SHARE, STOCK_*, flows
-
-    ФИКС: QTY >= 0 (Poisson)
-    """
     d = daily.copy()
     d["WEEK"] = d["TRADE_DT"].apply(week_start)
 
@@ -265,7 +371,7 @@ def aggregate_to_buckets(daily: pd.DataFrame) -> pd.DataFrame:
 
     def agg_group(g: pd.DataFrame) -> pd.Series:
         qty = float(g["QTY_TOTAL"].sum())
-        qty = max(qty, 0.0)  # критично для Poisson
+        qty = max(qty, 0.0)
 
         pvals = g["UNIT_PRICE"].astype(float).values
         price = np.nan
@@ -283,11 +389,8 @@ def aggregate_to_buckets(daily: pd.DataFrame) -> pd.DataFrame:
         ranges = [x for x in g["PROMO_RANGE"].tolist() if isinstance(x, tuple)] if "PROMO_RANGE" in g else []
         promo_share = promo_share_in_range(ranges, start, end) if ranges else float(g.get("IS_PROMO", pd.Series([0])).mean())
 
-        stock_start = float(g["START_STOCK"].iloc[0]) if "START_STOCK" in g else 0.0
         stock_end = float(g["END_STOCK"].iloc[-1]) if "END_STOCK" in g else 0.0
-        delivery = float(g["DELIVERY_QTY"].sum()) if "DELIVERY_QTY" in g else 0.0
-        loss = float(g["LOSS_QTY"].sum()) if "LOSS_QTY" in g else 0.0
-        ret = float(g["RETURN_QTY"].sum()) if "RETURN_QTY" in g else 0.0
+        stock_start = float(g["START_STOCK"].iloc[0]) if "START_STOCK" in g else 0.0
 
         return pd.Series({
             "QTY": qty,
@@ -295,9 +398,6 @@ def aggregate_to_buckets(daily: pd.DataFrame) -> pd.DataFrame:
             "PROMO_SHARE": promo_share,
             "STOCK_START": stock_start,
             "STOCK_END": stock_end,
-            "DELIVERY": delivery,
-            "LOSS": loss,
-            "RETURN": ret,
             "BUCKET_START": start,
             "BUCKET_END": end,
         })
@@ -305,24 +405,29 @@ def aggregate_to_buckets(daily: pd.DataFrame) -> pd.DataFrame:
     bucket_df = d.groupby(group_cols, as_index=False).apply(agg_group).reset_index(drop=True)
 
     bucket_df["WEEK_OF_YEAR"] = bucket_df["WEEK"].dt.isocalendar().week.astype(int)
-    bucket_df["YEAR"] = bucket_df["WEEK"].dt.year.astype(int)
     bucket_df["BUCKET_IDX"] = bucket_df["BUCKET"].map({b: i for i, b in enumerate(BUCKET_ORDER)}).astype(int)
 
-    # страховка по типам
+    woy = bucket_df["WEEK_OF_YEAR"].astype(float)
+    bucket_df["SIN_WOY"] = np.sin(2.0 * np.pi * woy / 52.0)
+    bucket_df["COS_WOY"] = np.cos(2.0 * np.pi * woy / 52.0)
+
+    min_week = bucket_df["WEEK"].min()
+    bucket_df["TREND_W"] = ((bucket_df["WEEK"] - min_week) / np.timedelta64(1, "W")).astype(float)
+
     bucket_df["QTY"] = pd.to_numeric(bucket_df["QTY"], errors="coerce").fillna(0.0).clip(lower=0.0)
     bucket_df["PRICE"] = pd.to_numeric(bucket_df["PRICE"], errors="coerce")
+    bucket_df["STOCK_END"] = pd.to_numeric(bucket_df["STOCK_END"], errors="coerce").fillna(0.0).clip(lower=0.0)
+
+    bucket_df["OOS_FLAG"] = (bucket_df["STOCK_END"] <= 0.0).astype(int)
 
     return bucket_df
 
 
 # =========================
-# Лаги
+# Lags
 # =========================
 
 def add_lag_features(bucket_df: pd.DataFrame, lags: int = 1) -> pd.DataFrame:
-    """
-    Лаги по (PRODUCT_CODE, STORE, BUCKET).
-    """
     d = bucket_df.copy().sort_values(["PRODUCT_CODE", "STORE", "BUCKET", "WEEK"])
     grp = d.groupby(["PRODUCT_CODE", "STORE", "BUCKET"], sort=False)
 
@@ -331,50 +436,36 @@ def add_lag_features(bucket_df: pd.DataFrame, lags: int = 1) -> pd.DataFrame:
         d[f"PRICE_L{k}"] = grp["PRICE"].shift(k)
         d[f"PROMO_L{k}"] = grp["PROMO_SHARE"].shift(k).fillna(0.0)
         d[f"STOCK_END_L{k}"] = grp["STOCK_END"].shift(k).fillna(0.0)
+        d[f"OOS_L{k}"] = grp["OOS_FLAG"].shift(k).fillna(0).astype(int)
 
+    d["LOG_PRICE_L1"] = d["PRICE_L1"].apply(lambda v: _safe_log(v) if np.isfinite(v) and v > 0 else 0.0)
     d["LOW_STOCK_FLAG"] = (d["STOCK_END_L1"].fillna(0.0) <= 1.0).astype(int)
+
     return d
 
 
 # =========================
-# Single Poisson модель + scaler
+# Models
 # =========================
 
 @dataclass
 class PoissonModel:
-    """
-    PoissonRegressor + StandardScaler.
-
-    Замечание про эластичность:
-      - мы используем признак LOG_PRICE = log(P)
-      - модель на масштабированных признаках
-      - own-elasticity (в исходных единицах) =
-            coef_scaled[idx_LOG_PRICE] / scaler.scale_[idx_LOG_PRICE]
-    """
     reg: PoissonRegressor
     scaler: StandardScaler
     feature_names: List[str]
     n: int
+    pos_sales: int
 
 
-def fit_poisson_model(df: pd.DataFrame,
-                      feature_names: List[str],
-                      alpha: float = POISSON_ALPHA) -> Optional[PoissonModel]:
-    """
-    Обучает PoissonRegressor (с масштабированием признаков).
-
-    ФИКСЫ:
-      - y клипуем >=0
-      - alpha >= 1e-2
-      - max_iter увеличен
-    """
+def fit_poisson(df: pd.DataFrame, feature_names: List[str], alpha: float = POISSON_ALPHA) -> Optional[PoissonModel]:
     g = df.copy()
     g = g.loc[np.isfinite(g["PRICE"].values) & (g["PRICE"].values > 0)]
     if len(g) < 20:
         return None
 
-    y = g["QTY"].astype(float).values
-    y = np.clip(y, 0.0, None)
+    g["LOG_PRICE"] = g["PRICE"].astype(float).apply(_safe_log)
+
+    y = np.clip(g["QTY"].astype(float).values, 0.0, None)
     if not np.isfinite(y).all():
         return None
 
@@ -383,397 +474,560 @@ def fit_poisson_model(df: pd.DataFrame,
     scaler = StandardScaler()
     Xs = scaler.fit_transform(X)
 
-    reg = PoissonRegressor(
-        alpha=max(alpha, 1e-2),
-        fit_intercept=True,
-        max_iter=POISSON_MAX_ITER
-    )
+    reg = PoissonRegressor(alpha=max(alpha, 1e-2), fit_intercept=True, max_iter=POISSON_MAX_ITER)
     reg.fit(Xs, y)
 
-    return PoissonModel(reg=reg, scaler=scaler, feature_names=list(feature_names), n=int(len(g)))
+    return PoissonModel(reg, scaler, list(feature_names), int(len(g)), int((y > 0).sum()))
 
 
-def poisson_predict_mean(model: PoissonModel, x_row_raw: np.ndarray) -> float:
-    """
-    Предсказывает E[Q] (x_row в исходном масштабе признаков).
-    """
-    Xs = model.scaler.transform(x_row_raw.reshape(1, -1))
-    mu = float(model.reg.predict(Xs)[0])
-    return max(mu, 0.0)
+def predict_mu(model: PoissonModel, x_raw: np.ndarray) -> float:
+    Xs = model.scaler.transform(x_raw.reshape(1, -1))
+    return max(float(model.reg.predict(Xs)[0]), 0.0)
 
 
-def model_elasticity_raw(model: PoissonModel, feature_name: str = "LOG_PRICE") -> Optional[float]:
-    """
-    Возвращает эластичность в исходных единицах для признака (по умолчанию LOG_PRICE).
-
-    beta_raw = beta_scaled / std(feature)
-    """
-    if feature_name not in model.feature_names:
+def coef_raw(model: PoissonModel, feature: str) -> Optional[float]:
+    if feature not in model.feature_names:
         return None
-    j = model.feature_names.index(feature_name)
+    j = model.feature_names.index(feature)
     std = float(model.scaler.scale_[j]) if model.scaler.scale_ is not None else 1.0
     if std <= 0:
         return None
     return float(model.reg.coef_[j]) / std
 
 
-# =========================
-# Иерархические single-модели (backoff по предсказаниям)
-# =========================
+@dataclass
+class DualModels:
+    nonpromo: Optional[PoissonModel]
+    promo: Optional[PoissonModel]
+
+
+def split_promo(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    nonpromo = df.loc[df["PROMO_SHARE"] <= PROMO_THRESHOLD].copy()
+    promo = df.loc[df["PROMO_SHARE"] > PROMO_THRESHOLD].copy()
+    return nonpromo, promo
+
+
+def train_dual(df: pd.DataFrame, feature_names: List[str], alpha: float) -> DualModels:
+    nonpromo_df, promo_df = split_promo(df)
+    m_np = fit_poisson(nonpromo_df, feature_names, alpha=alpha) if len(nonpromo_df) >= MIN_ROWS_SPLIT_MODEL else None
+    m_p = fit_poisson(promo_df, feature_names, alpha=alpha) if len(promo_df) >= MIN_ROWS_SPLIT_MODEL else None
+    return DualModels(nonpromo=m_np, promo=m_p)
+
+
+def choose_model_with_backoff(dm: DualModels, promo_share: float) -> Optional[PoissonModel]:
+    if promo_share > PROMO_THRESHOLD:
+        return dm.promo or dm.nonpromo
+    return dm.nonpromo or dm.promo
+
 
 @dataclass
-class HierModels:
-    """
-    Модели по уровням:
-      product_store, family, category, segment, global
-    """
-    global_model: Optional[PoissonModel]
-    segment: Dict[str, PoissonModel]
-    category: Dict[str, PoissonModel]
-    family: Dict[str, PoissonModel]
-    product_store: Dict[Tuple[str, str], PoissonModel]
+class HierDualModels:
+    global_model: Dict[str, DualModels]
+    segment: Dict[Tuple[str, str], DualModels]
+    category: Dict[Tuple[str, str], DualModels]
+    family: Dict[Tuple[str, str], DualModels]
+    product_store: Dict[Tuple[str, str, str], DualModels]
 
 
-def train_hier_models(bucket_df: pd.DataFrame,
-                      cutoff: pd.Timestamp,
-                      feature_names: List[str],
-                      alpha: float = POISSON_ALPHA) -> HierModels:
-    """
-    Обучает single Poisson модели на данных BUCKET_END <= cutoff.
-    """
+def train_hier_dual_models(bucket_df: pd.DataFrame,
+                           cutoff: pd.Timestamp,
+                           feature_names: List[str],
+                           alpha: float = POISSON_ALPHA) -> HierDualModels:
     train = bucket_df.loc[bucket_df["BUCKET_END"] <= pd.Timestamp(cutoff)].copy()
 
-    global_model = None
-    if len(train) >= MIN_ROWS_GLOBAL:
-        global_model = fit_poisson_model(train, feature_names, alpha=alpha)
+    global_models: Dict[str, DualModels] = {}
+    for b, g in train.groupby("BUCKET"):
+        if len(g) >= MIN_ROWS_GLOBAL:
+            global_models[str(b)] = train_dual(g, feature_names, alpha=alpha)
 
-    seg_models: Dict[str, PoissonModel] = {}
-    for seg, g in train.groupby("SEGMENT_CODE"):
-        if len(g) >= MIN_ROWS_SEGMENT:
-            m = fit_poisson_model(g, feature_names, alpha=alpha)
-            if m is not None:
-                seg_models[str(seg)] = m
+    seg_models: Dict[Tuple[str, str], DualModels] = {}
+    for (seg, b), g in train.groupby(["SEGMENT_CODE", "BUCKET"]):
+        if len(g) >= MIN_ROWS_LEVEL:
+            seg_models[(str(seg), str(b))] = train_dual(g, feature_names, alpha=alpha)
 
-    cat_models: Dict[str, PoissonModel] = {}
-    for cat, g in train.groupby("CATEGORY_CODE"):
-        if len(g) >= MIN_ROWS_CATEGORY:
-            m = fit_poisson_model(g, feature_names, alpha=alpha)
-            if m is not None:
-                cat_models[str(cat)] = m
+    cat_models: Dict[Tuple[str, str], DualModels] = {}
+    for (cat, b), g in train.groupby(["CATEGORY_CODE", "BUCKET"]):
+        if len(g) >= MIN_ROWS_LEVEL:
+            cat_models[(str(cat), str(b))] = train_dual(g, feature_names, alpha=alpha)
 
-    fam_models: Dict[str, PoissonModel] = {}
-    for fam, g in train.groupby("FAMILY_CODE"):
-        if len(g) >= MIN_ROWS_FAMILY:
-            m = fit_poisson_model(g, feature_names, alpha=alpha)
-            if m is not None:
-                fam_models[str(fam)] = m
+    fam_models: Dict[Tuple[str, str], DualModels] = {}
+    for (fam, b), g in train.groupby(["FAMILY_CODE", "BUCKET"]):
+        if len(g) >= MIN_ROWS_LEVEL:
+            fam_models[(str(fam), str(b))] = train_dual(g, feature_names, alpha=alpha)
 
-    ps_models: Dict[Tuple[str, str], PoissonModel] = {}
-    for (p, s), g in train.groupby(["PRODUCT_CODE", "STORE"]):
-        if len(g) >= MIN_ROWS_PRODUCT_STORE:
-            m = fit_poisson_model(g, feature_names, alpha=alpha)
-            if m is not None:
-                ps_models[(str(p), str(s))] = m
+    ps_models: Dict[Tuple[str, str, str], DualModels] = {}
+    for (sku, store, b), g in train.groupby(["PRODUCT_CODE", "STORE", "BUCKET"]):
+        if len(g) >= MIN_ROWS_PS:
+            ps_models[(str(sku), str(store), str(b))] = train_dual(g, feature_names, alpha=alpha)
 
-    return HierModels(
-        global_model=global_model,
-        segment=seg_models,
-        category=cat_models,
-        family=fam_models,
-        product_store=ps_models,
-    )
+    return HierDualModels(global_model=global_models, segment=seg_models, category=cat_models, family=fam_models, product_store=ps_models)
 
 
 def shrink_weight(n_child: int, k: int = DEFAULT_SHRINK_K) -> float:
-    """Вес детской модели для shrinkage по предсказанию."""
-    return float(n_child / (n_child + k))
-
-
-def predict_mu_backoff(base_row: pd.Series,
-                       candidate_price: float,
-                       feature_names: List[str],
-                       models: HierModels,
-                       k: int = DEFAULT_SHRINK_K) -> Optional[float]:
-    """
-    Предсказывает mu = E[Q] для кандидата цены через backoff по предсказаниям:
-      (PRODUCT,STORE) -> FAMILY -> CATEGORY -> SEGMENT -> GLOBAL
-
-    Логика:
-      - считаем mu на каждом доступном уровне
-      - смешиваем последовательно shrink_weight(n_child)
-    """
-    feat = make_single_features_for_candidate(base_row, candidate_price)
-    x = np.array([feat.get(fn, 0.0) for fn in feature_names], dtype=float)
-
-    p = str(base_row["PRODUCT_CODE"])
-    s = str(base_row["STORE"])
-    fam = str(base_row["FAMILY_CODE"])
-    cat = str(base_row["CATEGORY_CODE"])
-    seg = str(base_row["SEGMENT_CODE"])
-
-    mu = None
-
-    # product_store
-    m_ps = models.product_store.get((p, s))
-    if m_ps is not None:
-        mu = poisson_predict_mean(m_ps, x)
-
-    # family
-    m_fam = models.family.get(fam)
-    if m_fam is not None:
-        mu_fam = poisson_predict_mean(m_fam, x)
-        if mu is None:
-            mu = mu_fam
-        else:
-            w = shrink_weight(m_ps.n if m_ps is not None else 0, k=k)
-            mu = w * mu + (1 - w) * mu_fam
-
-    # category
-    m_cat = models.category.get(cat)
-    if m_cat is not None:
-        mu_cat = poisson_predict_mean(m_cat, x)
-        if mu is None:
-            mu = mu_cat
-        else:
-            # вес текущей "детской" оценки считаем как n на более детальном уровне
-            n_child = m_ps.n if m_ps is not None else (m_fam.n if m_fam is not None else 0)
-            w = shrink_weight(n_child, k=k)
-            mu = w * mu + (1 - w) * mu_cat
-
-    # segment
-    m_seg = models.segment.get(seg)
-    if m_seg is not None:
-        mu_seg = poisson_predict_mean(m_seg, x)
-        if mu is None:
-            mu = mu_seg
-        else:
-            n_child = m_ps.n if m_ps is not None else (m_fam.n if m_fam is not None else (m_cat.n if m_cat is not None else 0))
-            w = shrink_weight(n_child, k=k)
-            mu = w * mu + (1 - w) * mu_seg
-
-    # global
-    m_glb = models.global_model
-    if m_glb is not None:
-        mu_glb = poisson_predict_mean(m_glb, x)
-        if mu is None:
-            mu = mu_glb
-        else:
-            n_child = m_ps.n if m_ps is not None else (m_fam.n if m_fam is not None else (m_cat.n if m_cat is not None else (m_seg.n if m_seg is not None else 0)))
-            w = shrink_weight(n_child, k=k)
-            mu = w * mu + (1 - w) * mu_glb
-
-    if mu is None or not np.isfinite(mu):
-        return None
-    return float(max(mu, 0.0))
+    return float(n_child / (n_child + k)) if n_child > 0 else 0.0
 
 
 # =========================
-# Single признаки и оптимизация
+# REG_PRICE (regular price) + promo cap
 # =========================
 
-def make_single_features_for_candidate(base_row: pd.Series, candidate_price: float) -> Dict[str, float]:
-    """
-    Single признаки для кандидата цены.
+def is_valid_price(p: Optional[float]) -> bool:
+    return p is not None and np.isfinite(p) and float(p) > 0
 
-    LOG_PRICE = log(P) -> базовый канал own-price elasticity.
+
+def compute_reg_price(bucket_df: pd.DataFrame,
+                      sku: str,
+                      store: str,
+                      bucket: str,
+                      cutoff: pd.Timestamp,
+                      base_price: Optional[float],
+                      median_weeks: int = REG_PRICE_MEDIAN_WEEKS) -> Tuple[Optional[float], str]:
     """
+    REG_PRICE нужен для промо-cap и для стабильного сравнения "дорого/дёшево".
+
+    Источники (по приоритету):
+      1) BASE_BUCKET_LAST: base_price валиден (последняя цена в bucket до cutoff)
+      2) MEDIAN_LAST_NW_BUCKET: медиана цены за последние N недель в этом bucket
+      3) MEDIAN_LAST_NW_ANY_BUCKET: медиана цены за последние N недель по любому bucket
+      4) FALLBACK_NONE: ничего нет
+    """
+    if is_valid_price(base_price):
+        return float(base_price), "BASE_BUCKET_LAST"
+
+    cutoff = pd.Timestamp(cutoff)
+    min_week = week_start(cutoff) - pd.Timedelta(weeks=int(median_weeks))
+
+    # 2) bucket median
+    df_b = bucket_df.loc[
+        (bucket_df["PRODUCT_CODE"] == sku) &
+        (bucket_df["STORE"] == store) &
+        (bucket_df["BUCKET"] == bucket) &
+        (bucket_df["BUCKET_END"] <= cutoff) &
+        (bucket_df["WEEK"] >= min_week)
+    ].copy()
+    pr = pd.to_numeric(df_b["PRICE"], errors="coerce").astype(float)
+    pr = pr[np.isfinite(pr) & (pr > 0)]
+    if len(pr) >= REG_PRICE_MIN_POINTS:
+        return float(np.median(pr)), "MEDIAN_LAST_NW_BUCKET"
+
+    # 3) any bucket median
+    df_a = bucket_df.loc[
+        (bucket_df["PRODUCT_CODE"] == sku) &
+        (bucket_df["STORE"] == store) &
+        (bucket_df["BUCKET_END"] <= cutoff) &
+        (bucket_df["WEEK"] >= min_week)
+    ].copy()
+    pr = pd.to_numeric(df_a["PRICE"], errors="coerce").astype(float)
+    pr = pr[np.isfinite(pr) & (pr > 0)]
+    if len(pr) >= REG_PRICE_MIN_POINTS:
+        return float(np.median(pr)), "MEDIAN_LAST_NW_ANY_BUCKET"
+
+    return None, "FALLBACK_NONE"
+
+
+def discount_depth(candidate_price: float, reg_price: float) -> float:
+    if not is_valid_price(reg_price):
+        return 0.0
+    r = 1.0 - float(candidate_price) / float(reg_price)
+    return float(max(r, 0.0))
+
+
+def price_change_log(candidate_price: float, reg_price: float) -> float:
+    if not is_valid_price(reg_price):
+        return 0.0
+    return float(_safe_log(candidate_price) - _safe_log(reg_price))
+
+
+def make_features_for_candidate(base_row: pd.Series,
+                                candidate_price: float,
+                                reg_price: float,
+                                bucket: str,
+                                week_monday: pd.Timestamp) -> Dict[str, float]:
+    woy = int(pd.Timestamp(week_monday).isocalendar().week)
+    sin_woy = float(np.sin(2.0 * np.pi * woy / 52.0))
+    cos_woy = float(np.cos(2.0 * np.pi * woy / 52.0))
+    trend_w = float(base_row.get("TREND_W", 0.0))
+
+    promo_share = float(base_row.get("PROMO_SHARE", 0.0))
+
+    dd = discount_depth(candidate_price, reg_price)
+    pcl = price_change_log(candidate_price, reg_price)
+    promo_depth = float(dd * promo_share)
+
     return {
+        "LOG_PRICE_L1": float(_safe_log(candidate_price)),
         "LOG_PRICE": float(_safe_log(candidate_price)),
-        "PROMO_SHARE": float(base_row.get("PROMO_SHARE", 0.0)),
-        "BUCKET_IDX": float(base_row.get("BUCKET_IDX", 0.0)),
-        "WEEK_OF_YEAR": float(base_row.get("WEEK_OF_YEAR", 0.0)),
+        "DISCOUNT_DEPTH": float(dd),
+        "PRICE_CHANGE_LOG": float(pcl),
+        "PROMO_DEPTH": float(promo_depth),
+
+        "PROMO_SHARE": promo_share,
+        "BUCKET_IDX": float({"MON_THU": 0, "FRI": 1, "SAT_SUN": 2}[bucket]),
+        "SIN_WOY": sin_woy,
+        "COS_WOY": cos_woy,
+        "TREND_W": trend_w,
+
         "LOW_STOCK_FLAG": float(base_row.get("LOW_STOCK_FLAG", 0.0)),
+        "STOCK_END_L1": float(base_row.get("STOCK_END_L1", 0.0)),
+        "OOS_L1": float(base_row.get("OOS_L1", 0.0)),
+
         "QTY_L1": float(base_row.get("QTY_L1", 0.0)),
-        "PRICE_L1": float(base_row.get("PRICE_L1", 0.0)) if np.isfinite(base_row.get("PRICE_L1", np.nan)) else 0.0,
         "PROMO_L1": float(base_row.get("PROMO_L1", 0.0)),
     }
 
 
-def build_price_grid(base_price: float,
-                     min_mult: float = MIN_MULT,
-                     max_mult: float = MAX_MULT,
-                     n_mult: int = 15,
-                     observed_prices: Optional[np.ndarray] = None) -> np.ndarray:
+def apply_promo_cap_to_grid(grid: np.ndarray, reg_price: Optional[float], promo_share: float) -> Tuple[np.ndarray, Optional[float]]:
     """
-    Дискретная сетка цен:
-      base_price * linspace(min_mult, max_mult, n_mult)
-    + снап к лестнице observed_prices (если задана).
+    Жёсткое правило:
+      если PROMO_SHARE > PROMO_THRESHOLD => CHOSEN_PRICE <= REG_PRICE.
+    Возвращаем (grid2, cap_price).
     """
-    base_price = float(base_price)
-    if not np.isfinite(base_price) or base_price <= 0:
-        return np.array([], dtype=float)
-
-    grid = base_price * np.linspace(min_mult, max_mult, n_mult)
-
-    if observed_prices is not None and len(observed_prices) > 0:
-        ladder = np.unique(observed_prices[np.isfinite(observed_prices) & (observed_prices > 0)])
-        if len(ladder) > 0:
-            grid = np.array([ladder[np.argmin(np.abs(ladder - p))] for p in grid], dtype=float)
-
-    grid = np.unique(np.round(grid, 4))
-    return np.sort(grid)
+    if grid is None or len(grid) == 0:
+        return grid, None
+    if promo_share > PROMO_THRESHOLD and is_valid_price(reg_price):
+        cap = float(reg_price)
+        grid2 = grid[grid <= cap + 1e-9]
+        if len(grid2) == 0:
+            return np.array([cap], dtype=float), cap
+        return grid2, cap
+    return grid, None
 
 
-def collect_observed_price_ladder(bucket_df: pd.DataFrame, level: str = "FAMILY_CODE") -> Dict[str, np.ndarray]:
-    """Лестница наблюдавшихся цен по уровню (например FAMILY_CODE)."""
-    ladders: Dict[str, np.ndarray] = {}
-    for key, g in bucket_df.groupby(level):
-        prices = pd.to_numeric(g["PRICE"], errors="coerce").astype(float).values
-        prices = prices[np.isfinite(prices) & (prices > 0)]
-        if len(prices) > 0:
-            ladders[str(key)] = np.unique(np.round(prices, 4))
-    return ladders
+def objective(price: float, mu: float, reg_price: float, qty_scale: float) -> float:
+    revenue = float(price) * float(mu)
+    rel = float(price) / max(float(reg_price), 1e-6) - 1.0
+    penalty_price = LAMBDA_PRICE_PENALTY * (rel * rel) * (float(reg_price) * float(qty_scale))
+    return revenue - penalty_price
 
 
-def optimize_price_single_sku(base_row: pd.Series,
-                             feature_names: List[str],
-                             models: HierModels,
-                             price_grid: np.ndarray,
-                             stock_cap: Optional[float] = None,
-                             shrink_k: int = DEFAULT_SHRINK_K) -> Optional[Tuple[float, float, float]]:
-    """
-    Single-SKU оптимизация:
-      max_p p * E[Q(p)]  (через backoff предсказание)
+def predict_backoff_dual(base_row: pd.Series,
+                         candidate_price: float,
+                         reg_price: float,
+                         bucket: str,
+                         week_monday: pd.Timestamp,
+                         promo_share: float,
+                         feature_names: List[str],
+                         hier: HierDualModels) -> Tuple[Optional[float], Optional[float], str, int]:
+    feats = make_features_for_candidate(base_row, candidate_price, reg_price, bucket, week_monday)
+    x = np.array([feats.get(fn, 0.0) for fn in feature_names], dtype=float)
 
-    Возвращает:
-      (best_price, mu, revenue)
-    """
-    if price_grid is None or len(price_grid) == 0:
+    sku = str(base_row["PRODUCT_CODE"])
+    store = str(base_row["STORE"])
+    fam = str(base_row["FAMILY_CODE"])
+    cat = str(base_row["CATEGORY_CODE"])
+    seg = str(base_row["SEGMENT_CODE"])
+
+    levels: List[Tuple[str, PoissonModel]] = []
+
+    dm_ps = hier.product_store.get((sku, store, bucket))
+    if dm_ps is not None:
+        m = choose_model_with_backoff(dm_ps, promo_share)
+        if m is not None:
+            levels.append(("PRODUCT_STORE", m))
+
+    dm_f = hier.family.get((fam, bucket))
+    if dm_f is not None:
+        m = choose_model_with_backoff(dm_f, promo_share)
+        if m is not None:
+            levels.append(("FAMILY", m))
+
+    dm_c = hier.category.get((cat, bucket))
+    if dm_c is not None:
+        m = choose_model_with_backoff(dm_c, promo_share)
+        if m is not None:
+            levels.append(("CATEGORY", m))
+
+    dm_s = hier.segment.get((seg, bucket))
+    if dm_s is not None:
+        m = choose_model_with_backoff(dm_s, promo_share)
+        if m is not None:
+            levels.append(("SEGMENT", m))
+
+    dm_g = hier.global_model.get(bucket)
+    if dm_g is not None:
+        m = choose_model_with_backoff(dm_g, promo_share)
+        if m is not None:
+            levels.append(("GLOBAL", m))
+
+    if not levels:
+        return None, None, "NONE", 0
+
+    mu = None
+    beta = None
+    used_level = "NONE"
+    pos_sales_used = 0
+    n_child = 0
+
+    for lvl, m in levels:
+        mu_m = predict_mu(m, x)
+        beta_m = coef_raw(m, "LOG_PRICE_L1")
+
+        if mu is None:
+            mu = mu_m
+            beta = beta_m
+            used_level = lvl
+            pos_sales_used = m.pos_sales
+            n_child = m.n
+        else:
+            w = shrink_weight(n_child, DEFAULT_SHRINK_K)
+            mu = w * mu + (1 - w) * mu_m
+            if beta is None:
+                beta = beta_m
+            elif beta_m is not None:
+                beta = w * beta + (1 - w) * beta_m
+            n_child = max(n_child, m.n)
+
+    return float(max(mu, 0.0)) if mu is not None else None, beta, used_level, pos_sales_used
+
+
+def local_elasticity(p: float, mu_lo: float, mu_hi: float, delta: float) -> float:
+    p_lo = p * (1.0 - delta)
+    p_hi = p * (1.0 + delta)
+    num = np.log(max(mu_hi, 1e-9)) - np.log(max(mu_lo, 1e-9))
+    den = np.log(max(p_hi, 1e-9)) - np.log(max(p_lo, 1e-9))
+    return float(num / den) if den != 0 else np.nan
+
+
+def optimize_single(base_row: pd.Series,
+                    bucket: str,
+                    week_monday: pd.Timestamp,
+                    promo_share: float,
+                    feature_names: List[str],
+                    hier: HierDualModels,
+                    grid: np.ndarray,
+                    reg_price: float,
+                    stock_cap_end: Optional[float]) -> Optional[dict]:
+    grid, promo_cap_price = apply_promo_cap_to_grid(grid, reg_price, promo_share)
+    if grid is None or len(grid) == 0:
         return None
 
+    qty_scale = float(max(base_row.get("QTY_L1", 0.0), 1.0))
+
     best = None
-    for p in price_grid:
-        mu = predict_mu_backoff(base_row, float(p), feature_names, models, k=shrink_k)
+    meta = None
+
+    for p in grid:
+        mu, beta_raw, used_level, pos_sales_used = predict_backoff_dual(
+            base_row, float(p), float(reg_price), bucket, week_monday, promo_share, feature_names, hier
+        )
         if mu is None:
             continue
 
-        if stock_cap is not None and np.isfinite(stock_cap) and mu > float(stock_cap):
-            continue
+        if stock_cap_end is not None and np.isfinite(stock_cap_end):
+            mu = min(mu, float(stock_cap_end))
 
-        rev = float(p) * float(mu)
-        if best is None or rev > best[2]:
-            best = (float(p), float(mu), float(rev))
+        beta_used = beta_raw
+        if beta_used is None or not np.isfinite(beta_used) or beta_used > -BETA_FLOOR:
+            beta_used = -BETA_FLOOR
 
-    # если всё отфильтровано по stock_cap, берём минимальный спрос
-    if best is None and stock_cap is not None and np.isfinite(stock_cap):
-        best2 = None
-        for p in price_grid:
-            mu = predict_mu_backoff(base_row, float(p), feature_names, models, k=shrink_k)
-            if mu is None:
-                continue
-            rev = float(p) * float(mu)
-            if best2 is None or mu < best2[1]:
-                best2 = (float(p), float(mu), float(rev))
-        return best2
+        # калибруем наклон возле REG_PRICE
+        mu_adj = mu
+        if beta_raw is not None and np.isfinite(beta_raw):
+            rel_log = _safe_log(float(p)) - _safe_log(float(reg_price))
+            mu_adj = float(mu) * float(np.exp((beta_used - beta_raw) * rel_log))
+            mu_adj = max(mu_adj, 0.0)
+            if stock_cap_end is not None and np.isfinite(stock_cap_end):
+                mu_adj = min(mu_adj, float(stock_cap_end))
 
-    return best
+        score = objective(float(p), float(mu_adj), float(reg_price), qty_scale)
+        rev = float(p) * float(mu_adj)
+
+        if best is None or score > best[0]:
+            best = (score, float(p), float(mu_adj), float(rev))
+            meta = (beta_raw, beta_used, used_level, pos_sales_used, promo_cap_price)
+
+    if best is None:
+        return None
+
+    _, p_star, mu_star, rev_star = best
+    beta_raw, beta_used, used_level, pos_sales_used, promo_cap_price = meta
+
+    p_lo = p_star * (1.0 - LOCAL_ELASTICITY_DELTA)
+    p_hi = p_star * (1.0 + LOCAL_ELASTICITY_DELTA)
+
+    mu_lo, _, _, _ = predict_backoff_dual(base_row, p_lo, reg_price, bucket, week_monday, promo_share, feature_names, hier)
+    mu_hi, _, _, _ = predict_backoff_dual(base_row, p_hi, reg_price, bucket, week_monday, promo_share, feature_names, hier)
+    mu_lo = float(mu_lo) if mu_lo is not None else 0.0
+    mu_hi = float(mu_hi) if mu_hi is not None else 0.0
+
+    if stock_cap_end is not None and np.isfinite(stock_cap_end):
+        mu_lo = min(mu_lo, float(stock_cap_end))
+        mu_hi = min(mu_hi, float(stock_cap_end))
+
+    e_loc = local_elasticity(p_star, mu_lo, mu_hi, LOCAL_ELASTICITY_DELTA)
+
+    quality = "OK" if (pos_sales_used >= MIN_POS_SALES_FOR_ELAST and reg_price > 0) else "LOW_DATA"
+
+    dd = discount_depth(p_star, reg_price)
+    pcl = price_change_log(p_star, reg_price)
+    promo_depth = dd * promo_share
+
+    return {
+        "CHOSEN_PRICE": p_star,
+        "PRED_QTY": mu_star,
+        "PRED_REV": rev_star,
+        "OWN_ELASTICITY_RAW": beta_raw,
+        "OWN_ELASTICITY_USED": beta_used,
+        "LOCAL_ELASTICITY": e_loc,
+        "ELASTICITY_QUALITY": quality,
+        "USED_LEVEL": used_level,
+        "POS_SALES_USED": pos_sales_used,
+        "DISCOUNT_DEPTH": dd,
+        "PRICE_CHANGE_LOG": pcl,
+        "PROMO_DEPTH": promo_depth,
+        "PROMO_CAP_PRICE": promo_cap_price,
+    }
 
 
 # =========================
-# Cross-family модели (каннибализация) + scaler
+# Price ladder
+# =========================
+
+def collect_observed_price_ladder_by_family(bucket_df: pd.DataFrame) -> Dict[str, np.ndarray]:
+    ladders: Dict[str, np.ndarray] = {}
+    for fam, g in bucket_df.groupby("FAMILY_CODE"):
+        prices = pd.to_numeric(g["PRICE"], errors="coerce").astype(float).values
+        prices = prices[np.isfinite(prices) & (prices > 0)]
+        if len(prices) > 0:
+            ladders[str(fam)] = np.unique(np.round(prices, 4))
+    return ladders
+
+
+def build_price_grid(anchor_price: float, observed_prices: Optional[np.ndarray], n_mult: int = 15) -> np.ndarray:
+    """
+    ВАЖНО: сетку строим вокруг anchor_price (обычно REG_PRICE).
+    Это делает оптимизацию стабильнее, если BASE_PRICE пропал.
+    """
+    anchor_price = float(anchor_price)
+    if not np.isfinite(anchor_price) or anchor_price <= 0:
+        return np.array([], dtype=float)
+
+    lo = anchor_price * MIN_MULT
+    hi = anchor_price * MAX_MULT
+    grid = anchor_price * np.linspace(MIN_MULT, MAX_MULT, n_mult)
+
+    if observed_prices is not None and len(observed_prices) > 0:
+        ladder = np.unique(observed_prices[np.isfinite(observed_prices) & (observed_prices > 0)])
+        ladder = ladder[(ladder >= lo) & (ladder <= hi)]
+        if len(ladder) > 0:
+            grid = np.array([ladder[np.argmin(np.abs(ladder - p))] for p in grid], dtype=float)
+
+    grid = grid[(grid >= lo) & (grid <= hi)]
+    return np.sort(np.unique(np.round(grid, 4)))
+
+
+# =========================
+# Context helpers
+# =========================
+
+def get_base_price_and_stock_end(bucket_df: pd.DataFrame,
+                                 sku: str,
+                                 store: str,
+                                 bucket: str,
+                                 cutoff: pd.Timestamp) -> Tuple[Optional[float], Optional[float]]:
+    df_b = bucket_df.loc[
+        (bucket_df["PRODUCT_CODE"] == sku) &
+        (bucket_df["STORE"] == store) &
+        (bucket_df["BUCKET"] == bucket) &
+        (bucket_df["BUCKET_END"] <= pd.Timestamp(cutoff))
+    ].sort_values("BUCKET_END")
+
+    if len(df_b) > 0 and np.isfinite(df_b["PRICE"].iloc[-1]):
+        base_p = float(df_b["PRICE"].iloc[-1])
+        stock_end = float(df_b["STOCK_END"].iloc[-1]) if np.isfinite(df_b["STOCK_END"].iloc[-1]) else None
+        return base_p, stock_end
+
+    df_any = bucket_df.loc[
+        (bucket_df["PRODUCT_CODE"] == sku) &
+        (bucket_df["STORE"] == store) &
+        (bucket_df["BUCKET_END"] <= pd.Timestamp(cutoff))
+    ].sort_values("BUCKET_END")
+    if len(df_any) == 0:
+        return None, None
+
+    base_p = float(df_any["PRICE"].iloc[-1]) if np.isfinite(df_any["PRICE"].iloc[-1]) else None
+    stock_end = float(df_any["STOCK_END"].iloc[-1]) if np.isfinite(df_any["STOCK_END"].iloc[-1]) else None
+    return base_p, stock_end
+
+
+def build_context(bucket_df: pd.DataFrame, cutoff: pd.Timestamp) -> pd.DataFrame:
+    train = bucket_df.loc[bucket_df["BUCKET_END"] <= pd.Timestamp(cutoff)].copy()
+    recent = train.sort_values("BUCKET_END").groupby(["PRODUCT_CODE", "STORE"]).tail(12)
+    return recent.sort_values("BUCKET_END").groupby(["PRODUCT_CODE", "STORE"]).tail(1).copy()
+
+
+# =========================
+# Cross-family (как в v4, но cap по REG_PRICE)
 # =========================
 
 @dataclass
 class CrossFamilyModel:
-    """
-    Cross-модель внутри (FAMILY, STORE, BUCKET) для Top-K SKU.
-
-    Для каждого SKU i:
-      log(E[Q_i]) = a_i + sum_j gamma_{i,j} * log(P_j)
-    => gamma_{i,j} — кросс-эластичности.
-    """
     family_code: str
     store: str
     bucket: str
-    family_products: List[str]                      # порядок признаков
-    scaler: StandardScaler                          # общий scaler по X (log prices)
-    models_by_product: Dict[str, PoissonRegressor]  # отдельная модель на каждый SKU i
-    n_by_product: Dict[str, int]
+    family_products: List[str]
+    scaler: StandardScaler
+    models_by_product: Dict[str, PoissonRegressor]
 
 
-def build_family_topk(bucket_df: pd.DataFrame,
-                      cutoff: pd.Timestamp,
-                      top_k: int = CROSS_TOP_K,
-                      lookback_weeks: int = CROSS_LOOKBACK_WEEKS) -> Dict[Tuple[str, str, str], List[str]]:
-    """
-    Top-K SKU по сумме QTY за lookback_weeks до cutoff внутри (FAMILY, STORE, BUCKET).
-    + фильтры по объёму/неделям для ускорения.
-    """
+def build_family_topk_for_context(bucket_df: pd.DataFrame,
+                                  cutoff: pd.Timestamp,
+                                  context_keys: Set[Tuple[str, str, str]]) -> Dict[Tuple[str, str, str], List[str]]:
     df = bucket_df.loc[bucket_df["BUCKET_END"] <= pd.Timestamp(cutoff)].copy()
-    min_week = pd.Timestamp(cutoff) - pd.Timedelta(weeks=int(lookback_weeks))
+    min_week = pd.Timestamp(cutoff) - pd.Timedelta(weeks=int(CROSS_LOOKBACK_WEEKS))
     df = df.loc[df["WEEK"] >= min_week]
 
     topk_map: Dict[Tuple[str, str, str], List[str]] = {}
     for (fam, store, bucket), g in df.groupby(["FAMILY_CODE", "STORE", "BUCKET"]):
+        key = (str(fam), str(store), str(bucket))
+        if key not in context_keys:
+            continue
         if g["WEEK"].nunique() < CROSS_MIN_FAMILY_WEEKS:
             continue
-        fam_sum = float(g["QTY"].sum())
-        if fam_sum < CROSS_MIN_FAMILY_SUM_QTY:
+        if float(g["QTY"].sum()) < CROSS_MIN_FAMILY_SUM_QTY:
             continue
-
         sku_sales = g.groupby("PRODUCT_CODE")["QTY"].sum().sort_values(ascending=False)
-        skus = [str(x) for x in sku_sales.head(top_k).index.tolist()]
+        skus = [str(x) for x in sku_sales.head(CROSS_TOP_K).index.tolist()]
         if len(skus) >= 2:
-            topk_map[(str(fam), str(store), str(bucket))] = skus
-
+            topk_map[key] = skus
     return topk_map
 
 
 def make_family_wide_panel(bucket_df: pd.DataFrame,
-                           family_code: str,
+                           fam: str,
                            store: str,
                            bucket: str,
-                           family_products: List[str],
+                           skus: List[str],
                            cutoff: pd.Timestamp) -> pd.DataFrame:
-    """
-    Wide по WEEK:
-      Q_<sku>, LOGP_<sku>
-    Цены логируем и ffill для контекста конкурентов.
-    """
     df = bucket_df.loc[
-        (bucket_df["FAMILY_CODE"] == str(family_code)) &
-        (bucket_df["STORE"] == str(store)) &
-        (bucket_df["BUCKET"] == str(bucket)) &
+        (bucket_df["FAMILY_CODE"] == fam) &
+        (bucket_df["STORE"] == store) &
+        (bucket_df["BUCKET"] == bucket) &
         (bucket_df["BUCKET_END"] <= pd.Timestamp(cutoff)) &
-        (bucket_df["PRODUCT_CODE"].isin(family_products))
+        (bucket_df["PRODUCT_CODE"].isin(skus))
     ].copy()
-
     if len(df) == 0:
         return pd.DataFrame()
 
-    df = df.groupby(["WEEK", "PRODUCT_CODE"], as_index=False).agg(
-        QTY=("QTY", "sum"),
-        PRICE=("PRICE", "mean"),
-    )
+    df = df.groupby(["WEEK", "PRODUCT_CODE"], as_index=False).agg(QTY=("QTY", "sum"), PRICE=("PRICE", "mean"))
 
     qty_w = df.pivot(index="WEEK", columns="PRODUCT_CODE", values="QTY").add_prefix("Q_")
     prc_w = df.pivot(index="WEEK", columns="PRODUCT_CODE", values="PRICE").add_prefix("P_")
     wide = qty_w.join(prc_w, how="outer").sort_index()
 
-    for sku in family_products:
+    for sku in skus:
         pcol = f"P_{sku}"
         lcol = f"LOGP_{sku}"
-        if pcol in wide.columns:
-            wide[lcol] = wide[pcol].astype(float).apply(lambda v: _safe_log(v) if np.isfinite(v) else np.nan)
-        else:
-            wide[lcol] = np.nan
+        wide[lcol] = wide[pcol].apply(lambda v: _safe_log(v) if np.isfinite(v) and v > 0 else np.nan) if pcol in wide.columns else np.nan
 
-    logp_cols = [f"LOGP_{sku}" for sku in family_products]
-    wide[logp_cols] = wide[logp_cols].ffill()
-
+    log_cols = [f"LOGP_{s}" for s in skus]
+    wide[log_cols] = wide[log_cols].ffill()
     return wide
 
 
 def train_cross_family_models(bucket_df: pd.DataFrame,
                               cutoff: pd.Timestamp,
-                              topk_map: Dict[Tuple[str, str, str], List[str]],
-                              alpha: float = POISSON_ALPHA,
-                              min_rows_per_sku: int = CROSS_MIN_ROWS_PER_SKU) -> Dict[Tuple[str, str, str], CrossFamilyModel]:
-    """
-    Обучает cross-модели:
-      - общий scaler на X=[log prices of K skus]
-      - отдельный PoissonRegressor на каждый SKU i (y=Q_i)
-    """
+                              topk_map: Dict[Tuple[str, str, str], List[str]]) -> Dict[Tuple[str, str, str], CrossFamilyModel]:
     out: Dict[Tuple[str, str, str], CrossFamilyModel] = {}
 
     for (fam, store, bucket), skus in topk_map.items():
@@ -782,583 +1036,413 @@ def train_cross_family_models(bucket_df: pd.DataFrame,
             continue
 
         X_cols = [f"LOGP_{sku}" for sku in skus]
-        X_all = wide[X_cols].astype(float)
-        # выкинем строки где вообще нет признаков
-        X_all = X_all.replace([np.inf, -np.inf], np.nan)
+        X_all = wide[X_cols].astype(float).replace([np.inf, -np.inf], np.nan)
 
-        # scaler общий (чтобы коэффициенты были сравнимы)
         scaler = StandardScaler()
-        X_fit = X_all.fillna(0.0).values
-        Xs_all = scaler.fit_transform(X_fit)
+        scaler.fit(X_all.fillna(0.0).values)
 
         models_by_product: Dict[str, PoissonRegressor] = {}
-        n_by_product: Dict[str, int] = {}
-
         for sku in skus:
             y_col = f"Q_{sku}"
             if y_col not in wide.columns:
                 continue
-
-            # строки где y определён + есть собственная LOGP (цена была известна)
             data = pd.concat([wide[y_col], X_all], axis=1).dropna(subset=[y_col, f"LOGP_{sku}"])
-            if len(data) < min_rows_per_sku:
+            if len(data) < CROSS_MIN_ROWS_PER_SKU:
                 continue
-
-            y = data[y_col].astype(float).values
-            # ФИКС: y >= 0 для Poisson
-            y = np.clip(y, 0.0, None)
-            if not np.isfinite(y).all():
-                continue
+            y = np.clip(data[y_col].astype(float).values, 0.0, None)
             if (y > 0).sum() < 5:
                 continue
+            Xs = scaler.transform(X_all.loc[data.index].fillna(0.0).values)
 
-            # соответствующие X строки -> берём из X_all по индексам data
-            X_sub = X_all.loc[data.index].fillna(0.0).values
-            Xs = scaler.transform(X_sub)
-
-            reg = PoissonRegressor(
-                alpha=max(alpha, 1e-2),
-                fit_intercept=True,
-                max_iter=POISSON_MAX_ITER
-            )
+            reg = PoissonRegressor(alpha=max(POISSON_ALPHA, 1e-2), fit_intercept=True, max_iter=POISSON_MAX_ITER)
             reg.fit(Xs, y)
-
             models_by_product[sku] = reg
-            n_by_product[sku] = int(len(data))
 
         if len(models_by_product) >= 2:
-            out[(fam, store, bucket)] = CrossFamilyModel(
-                family_code=fam,
-                store=store,
-                bucket=bucket,
-                family_products=skus,
-                scaler=scaler,
-                models_by_product=models_by_product,
-                n_by_product=n_by_product
-            )
+            out[(fam, store, bucket)] = CrossFamilyModel(fam, store, bucket, skus, scaler, models_by_product)
 
     return out
 
 
 def predict_family_demands(cfm: CrossFamilyModel, prices: Dict[str, float]) -> Dict[str, float]:
-    """
-    Предсказывает E[Q_i] для всех SKU i из cross-модели при ценах всех Top-K.
-    """
-    skus = cfm.family_products
-    X_raw = np.array([_safe_log(prices[sku]) for sku in skus], dtype=float).reshape(1, -1)
+    X_raw = np.array([_safe_log(prices[sku]) for sku in cfm.family_products], dtype=float).reshape(1, -1)
     Xs = cfm.scaler.transform(X_raw)
-
     out: Dict[str, float] = {}
     for sku, reg in cfm.models_by_product.items():
-        mu = float(reg.predict(Xs)[0])
-        out[sku] = max(mu, 0.0)
-    return out
-
-
-def cross_elasticity_raw(cfm: CrossFamilyModel, demand_sku: str, price_sku: str) -> Optional[float]:
-    """
-    Возвращает gamma_{i,j} в исходных единицах:
-      gamma_raw = coef_scaled[j] / std(log(P_j))
-    """
-    if demand_sku not in cfm.models_by_product:
-        return None
-    if price_sku not in cfm.family_products:
-        return None
-    j = cfm.family_products.index(price_sku)
-    std = float(cfm.scaler.scale_[j]) if cfm.scaler.scale_ is not None else 1.0
-    if std <= 0:
-        return None
-    coef_scaled = float(cfm.models_by_product[demand_sku].coef_[j])
-    return coef_scaled / std
-
-
-def optimize_family_prices_iterative(cfm: CrossFamilyModel,
-                                     base_prices: Dict[str, float],
-                                     price_grids: Dict[str, np.ndarray],
-                                     iters: int = CROSS_ITERS,
-                                     stock_caps: Optional[Dict[str, float]] = None) -> Dict[str, Tuple[float, float, float]]:
-    """
-    Итеративная оптимизация family (best-response):
-      - фиксируем цены конкурентов
-      - перебор цен SKU i по сетке
-      - max p_i * E[Q_i | все цены]
-    """
-    prices = dict(base_prices)
-
-    def best_for_sku(sku: str) -> Tuple[float, float, float]:
-        grid = price_grids.get(sku)
-        if grid is None or len(grid) == 0:
-            p0 = float(prices[sku])
-            mu0 = float(predict_family_demands(cfm, prices).get(sku, 0.0))
-            return p0, mu0, float(p0 * mu0)
-
-        best = None
-        for p in grid:
-            tmp = dict(prices)
-            tmp[sku] = float(p)
-            mu = float(predict_family_demands(cfm, tmp).get(sku, 0.0))
-            cap = None if stock_caps is None else stock_caps.get(sku)
-            if cap is not None and np.isfinite(cap) and mu > float(cap):
-                continue
-            rev = float(p) * mu
-            if best is None or rev > best[2]:
-                best = (float(p), mu, float(rev))
-
-        if best is None:
-            # если всё отфильтровано cap-ом
-            best2 = None
-            for p in grid:
-                tmp = dict(prices)
-                tmp[sku] = float(p)
-                mu = float(predict_family_demands(cfm, tmp).get(sku, 0.0))
-                rev = float(p) * mu
-                if best2 is None or mu < best2[1]:
-                    best2 = (float(p), mu, float(rev))
-            return best2
-
-        return best
-
-    for _ in range(int(iters)):
-        for sku in cfm.family_products:
-            if sku not in prices:
-                continue
-            p_star, _, _ = best_for_sku(sku)
-            prices[sku] = p_star
-
-    mu_all = predict_family_demands(cfm, prices)
-    out: Dict[str, Tuple[float, float, float]] = {}
-    for sku in cfm.family_products:
-        p = float(prices[sku])
-        mu = float(mu_all.get(sku, 0.0))
-        out[sku] = (p, mu, float(p * mu))
+        out[sku] = max(float(reg.predict(Xs)[0]), 0.0)
     return out
 
 
 # =========================
-# Прод: цены на всю неделю (3 бакета), запуск в понедельник
+# Run (single + cross)
 # =========================
 
-def price_week_3_buckets(bucket_df: pd.DataFrame,
-                         daily_df: pd.DataFrame,
-                         as_of_date: pd.Timestamp,
-                         shrink_k: int = DEFAULT_SHRINK_K,
-                         alpha: float = POISSON_ALPHA,
-                         cross_top_k: int = CROSS_TOP_K,
-                         cross_lookback_weeks: int = CROSS_LOOKBACK_WEEKS,
-                         cross_min_rows_per_sku: int = CROSS_MIN_ROWS_PER_SKU,
-                         cross_iters: int = CROSS_ITERS) -> pd.DataFrame:
-    """
-    Понедельник утром: считаем цены на текущую неделю для MON_THU/FRI/SAT_SUN.
+def buckets_for_mode(mode: str) -> List[str]:
+    mode = mode.lower().strip()
+    if mode == "monday":
+        return ["MON_THU"]
+    if mode == "friday":
+        return ["FRI", "SAT_SUN"]
+    raise ValueError("mode must be 'monday' or 'friday'")
 
-    Важный фикс скорости:
-      - single hier модели обучаем ОДИН раз на cutoff=today
-      - cross модели обучаем по бакетам (3 раза), но тоже на cutoff=today
 
-    Cutoff для вывода:
-      decision_cutoff_rule = decision_cutoff_for_bucket(week, bucket)
-      cutoff_effective = min(decision_cutoff_rule, today)
-      В понедельник: для FRI/SAT_SUN это будет today (без "подглядывания").
-    """
+def calculate_for_week(bucket_df: pd.DataFrame,
+                       daily_df: pd.DataFrame,
+                       as_of_date: pd.Timestamp,
+                       week_monday: pd.Timestamp,
+                       mode: str) -> pd.DataFrame:
     today = pd.Timestamp(as_of_date).normalize()
-    target_week = week_start(today)
+    promo_map = build_promo_map(daily_df)
 
-    # обучающие данные только до today
-    train_all = bucket_df.loc[bucket_df["BUCKET_END"] <= today].copy()
+    buckets = buckets_for_mode(mode)
+
+    cutoffs: Dict[str, pd.Timestamp] = {}
+    for b in buckets:
+        rule = decision_cutoff_for_bucket_by_mode(week_monday, b, mode).normalize()
+        cutoffs[b] = min(rule, today, HISTORY_END.normalize())
+
+    max_cutoff = max(cutoffs.values())
+    train_all = bucket_df.loc[bucket_df["BUCKET_END"] <= max_cutoff].copy()
     if len(train_all) == 0:
         return pd.DataFrame()
 
-    promo_map = build_promo_map(daily_df)
+    fam_ladder = collect_observed_price_ladder_by_family(train_all)
 
-    # кандидаты SKU (контекст): последние 12 записей на (product,store)
-    recent = train_all.sort_values("BUCKET_END").groupby(["PRODUCT_CODE", "STORE"]).tail(12)
-    last_ctx = recent.sort_values("BUCKET_END").groupby(["PRODUCT_CODE", "STORE"]).tail(1).copy()
-
-    # single признаки
-    single_feature_names = [
+    feature_names = [
+        "LOG_PRICE_L1",
         "LOG_PRICE",
+        "DISCOUNT_DEPTH",
+        "PRICE_CHANGE_LOG",
+        "PROMO_DEPTH",
         "PROMO_SHARE",
         "BUCKET_IDX",
-        "WEEK_OF_YEAR",
+        "SIN_WOY",
+        "COS_WOY",
+        "TREND_W",
         "LOW_STOCK_FLAG",
+        "STOCK_END_L1",
+        "OOS_L1",
         "QTY_L1",
-        "PRICE_L1",
         "PROMO_L1",
     ]
 
-    # (A) single модели: 1 раз
-    hier_models = train_hier_models(train_all, cutoff=today, feature_names=single_feature_names, alpha=alpha)
+    hier = train_hier_dual_models(train_all, cutoff=max_cutoff, feature_names=feature_names, alpha=POISSON_ALPHA)
 
-    # (B) cross модели: по бакетам (быстро благодаря фильтрам + Top-K=5)
-    cross_by_bucket: Dict[str, Dict[Tuple[str, str, str], CrossFamilyModel]] = {}
-    for bucket in BUCKET_ORDER:
-        topk_map = build_family_topk(
-            train_all, cutoff=today,
-            top_k=cross_top_k,
-            lookback_weeks=cross_lookback_weeks
-        )
-        # build_family_topk уже вернул по всем бакетам, но ключ содержит bucket.
-        # train_cross_family_models сам фильтрует по bucket внутри wide-panel.
-        cross_models = train_cross_family_models(
-            train_all, cutoff=today,
-            topk_map=topk_map,
-            alpha=alpha,
-            min_rows_per_sku=cross_min_rows_per_sku
-        )
-        cross_by_bucket[bucket] = cross_models
+    out_rows: List[dict] = []
 
-    # ladder для снапа (на today)
-    fam_ladder = collect_observed_price_ladder(train_all, level="FAMILY_CODE")
+    for bucket in buckets:
+        start, end = bucket_start_end(week_monday, bucket)
+        cutoff_rule = decision_cutoff_for_bucket_by_mode(week_monday, bucket, mode).normalize()
+        cutoff = cutoffs[bucket]
 
-    out_all: List[pd.DataFrame] = []
+        ctx = build_context(bucket_df, cutoff=cutoff)
+        if len(ctx) == 0:
+            continue
 
-    for bucket in BUCKET_ORDER:
-        start, end = bucket_start_end(target_week, bucket)
-        decision_cutoff = decision_cutoff_for_bucket(target_week, bucket)
-        cutoff_effective = min(pd.Timestamp(decision_cutoff).normalize(), today)
+        # Cross models
+        context_keys = set((str(f), str(s), bucket) for f, s in zip(ctx["FAMILY_CODE"].astype(str), ctx["STORE"].astype(str)))
+        topk_map = build_family_topk_for_context(train_all, cutoff=cutoff, context_keys=context_keys)
+        cross_models = train_cross_family_models(train_all, cutoff=cutoff, topk_map=topk_map)
 
-        # контекст под целевой бакет
-        ctx = last_ctx.copy()
-        ctx["WEEK"] = pd.Timestamp(target_week)
-        ctx["BUCKET"] = bucket
-        ctx["BUCKET_IDX"] = {"MON_THU": 0, "FRI": 1, "SAT_SUN": 2}[bucket]
-        ctx["WEEK_OF_YEAR"] = int(pd.Timestamp(target_week).isocalendar().week)
+        used_in_cross: Set[Tuple[str, str]] = set()
 
-        # cross модели для этого бакета
-        cross_models = cross_by_bucket.get(bucket, {})
-
-        used_in_cross = set()
-        out_rows: List[dict] = []
-
-        # ---------- 1) семьи с cross-моделью ----------
+        # ---- Cross-family optimize ----
         for (fam, store), gfam in ctx.groupby(["FAMILY_CODE", "STORE"]):
             key = (str(fam), str(store), str(bucket))
             cfm = cross_models.get(key)
             if cfm is None:
                 continue
 
-            present_skus = set(gfam["PRODUCT_CODE"].astype(str))
-            fam_skus = [sku for sku in cfm.family_products if sku in present_skus]
-            if len(fam_skus) < 2:
-                continue
+            base_prices: Dict[str, Optional[float]] = {}
+            stock_caps: Dict[str, Optional[float]] = {}
+            promo_shares: Dict[str, float] = {}
 
-            base_prices: Dict[str, float] = {}
+            # REG_PRICE per sku, grid anchored by REG_PRICE, then promo-cap at REG_PRICE
+            reg_prices: Dict[str, Optional[float]] = {}
+            reg_sources: Dict[str, str] = {}
             grids: Dict[str, np.ndarray] = {}
-            stock_caps: Dict[str, float] = {}
-            tmp_prices: List[float] = []
+            promo_caps: Dict[str, Optional[float]] = {}
 
-            # базовые цены/сетки для SKU, которые реально есть в контексте
             for _, rr in gfam.iterrows():
                 sku = str(rr["PRODUCT_CODE"])
-                if sku not in cfm.family_products:
+                store_s = str(store)
+
+                ranges = promo_map.get((sku, store_s), [])
+                ps = promo_share_in_range(ranges, start, end) if ranges else 0.0
+
+                base_p, stock_end = get_base_price_and_stock_end(train_all, sku, store_s, bucket, cutoff=cutoff)
+
+                reg_p, reg_src = compute_reg_price(train_all, sku, store_s, bucket, cutoff=cutoff, base_price=base_p,
+                                                   median_weeks=REG_PRICE_MEDIAN_WEEKS)
+                if not is_valid_price(reg_p):
                     continue
-
-                # base price: последняя цена по этому бакету до today, иначе последняя известная до today
-                hist_b = train_all.loc[
-                    (train_all["PRODUCT_CODE"] == sku) &
-                    (train_all["STORE"] == str(store)) &
-                    (train_all["BUCKET"] == bucket)
-                ].sort_values("BUCKET_END")
-
-                if len(hist_b) and np.isfinite(hist_b["PRICE"].iloc[-1]):
-                    base_price = float(hist_b["PRICE"].iloc[-1])
-                else:
-                    hist_any = train_all.loc[
-                        (train_all["PRODUCT_CODE"] == sku) &
-                        (train_all["STORE"] == str(store))
-                    ].sort_values("BUCKET_END")
-                    base_price = float(hist_any["PRICE"].iloc[-1]) if len(hist_any) and np.isfinite(hist_any["PRICE"].iloc[-1]) else np.nan
-
-                if not np.isfinite(base_price) or base_price <= 0:
-                    continue
-
-                base_prices[sku] = base_price
-                tmp_prices.append(base_price)
 
                 ladder = fam_ladder.get(str(fam))
-                grids[sku] = build_price_grid(base_price, observed_prices=ladder)
+                grid = build_price_grid(float(reg_p), observed_prices=ladder)
 
-                # stock cap: последний END_STOCK
-                hist_any2 = train_all.loc[
-                    (train_all["PRODUCT_CODE"] == sku) &
-                    (train_all["STORE"] == str(store))
-                ].sort_values("BUCKET_END")
-                stock_caps[sku] = float(hist_any2["STOCK_END"].iloc[-1]) if len(hist_any2) else np.nan
+                grid2, cap_price = apply_promo_cap_to_grid(grid, reg_p, ps)
 
-            fam_skus = [x for x in fam_skus if x in base_prices]
-            if len(fam_skus) < 2:
+                base_prices[sku] = base_p
+                stock_caps[sku] = stock_end
+                promo_shares[sku] = float(ps)
+
+                reg_prices[sku] = float(reg_p)
+                reg_sources[sku] = reg_src
+                grids[sku] = grid2
+                promo_caps[sku] = cap_price
+
+            active = [sku for sku in cfm.family_products if sku in reg_prices and sku in cfm.models_by_product and len(grids.get(sku, [])) > 0]
+            if len(active) < 2:
                 continue
 
-            # Для predict_family_demands нужны цены всех Top-K -> заполняем медианой
-            median_price = float(np.median(tmp_prices)) if len(tmp_prices) else 1.0
-            for sku in cfm.family_products:
-                if sku not in base_prices:
-                    base_prices[sku] = median_price
-                if sku not in grids:
-                    grids[sku] = np.array([base_prices[sku]], dtype=float)
-                if sku not in stock_caps:
-                    stock_caps[sku] = np.nan
+            prices = {sku: float(reg_prices[sku]) for sku in active}
 
-            fam_solution = optimize_family_prices_iterative(
-                cfm=cfm,
-                base_prices=base_prices,
-                price_grids=grids,
-                iters=cross_iters,
-                stock_caps=stock_caps
-            )
+            for _ in range(CROSS_ITERS):
+                for sku in active:
+                    grid = grids.get(sku)
+                    if grid is None or len(grid) == 0:
+                        continue
+                    best = None
+                    for p in grid:
+                        tmp = dict(prices)
+                        tmp[sku] = float(p)
+                        mu = float(predict_family_demands(cfm, tmp).get(sku, 0.0))
+
+                        cap = stock_caps.get(sku)
+                        if cap is not None and np.isfinite(cap):
+                            mu = min(mu, float(cap))
+
+                        score = objective(float(p), mu, reg_prices[sku], qty_scale=1.0)
+                        if best is None or score > best[0]:
+                            best = (score, float(p), mu)
+                    if best is not None:
+                        prices[sku] = best[1]
+
+            mu_all = predict_family_demands(cfm, prices)
 
             for _, rr in gfam.iterrows():
                 sku = str(rr["PRODUCT_CODE"])
-                if sku not in fam_solution:
+                if sku not in prices:
                     continue
 
-                # промо доля по плану
-                ranges = promo_map.get((sku, str(store)), [])
-                promo_share = promo_share_in_range(ranges, start, end) if ranges else 0.0
+                ps = promo_shares.get(sku, 0.0)
+                stock_end = stock_caps.get(sku)
 
-                chosen_price, pred_qty, pred_rev = fam_solution[sku]
+                base_p = base_prices.get(sku)
+                reg_p = reg_prices.get(sku)
+                reg_src = reg_sources.get(sku, "FALLBACK_NONE")
+                cap_p = promo_caps.get(sku)
+
+                chosen_price = float(prices[sku])
+                mu = float(mu_all.get(sku, 0.0))
+                if stock_end is not None and np.isfinite(stock_end):
+                    mu = min(mu, float(stock_end))
+
+                p = chosen_price
+                p_lo = p * (1.0 - LOCAL_ELASTICITY_DELTA)
+                p_hi = p * (1.0 + LOCAL_ELASTICITY_DELTA)
+                tmp_lo = dict(prices); tmp_lo[sku] = p_lo
+                tmp_hi = dict(prices); tmp_hi[sku] = p_hi
+                mu_lo = float(predict_family_demands(cfm, tmp_lo).get(sku, 0.0))
+                mu_hi = float(predict_family_demands(cfm, tmp_hi).get(sku, 0.0))
+                if stock_end is not None and np.isfinite(stock_end):
+                    mu_lo = min(mu_lo, float(stock_end))
+                    mu_hi = min(mu_hi, float(stock_end))
+                e_loc = local_elasticity(p, mu_lo, mu_hi, LOCAL_ELASTICITY_DELTA)
 
                 out_rows.append({
                     "PRODUCT_CODE": sku,
                     "STORE": str(store),
                     "FAMILY_CODE": str(fam),
+
                     "AS_OF_DATE": today,
-                    "TARGET_WEEK": pd.Timestamp(target_week),
+                    "TARGET_WEEK": week_monday,
                     "TARGET_BUCKET": bucket,
                     "BUCKET_START": start,
                     "BUCKET_END": end,
-                    "DECISION_CUTOFF_RULE": pd.Timestamp(decision_cutoff).normalize(),
-                    "CUTOFF_EFFECTIVE": cutoff_effective,
-                    "PROMO_SHARE": promo_share,
-                    "STOCK_CAP": stock_caps.get(sku),
-                    "BASE_PRICE": float(base_prices[sku]),
+
+                    "DECISION_CUTOFF_RULE": cutoff_rule,
+                    "CUTOFF_EFFECTIVE": cutoff,
+
+                    "PROMO_SHARE": ps,
+                    "STOCK_END_BUCKET_CAP": stock_end,
+
+                    "BASE_PRICE": base_p,
+                    "REG_PRICE": reg_p,
+                    "REG_PRICE_SOURCE": reg_src,
+
+                    "PROMO_CAP_PRICE": cap_p,
+                    "PROMO_PRICE_CAPPED": bool(ps > PROMO_THRESHOLD and is_valid_price(cap_p)),
+
                     "CHOSEN_PRICE": chosen_price,
-                    "PRED_QTY": pred_qty,
-                    "PRED_REV": pred_rev,
+                    "PRICE_MULT": chosen_price / max(float(reg_p), 1e-6) if reg_p else np.nan,
+
+                    "PRED_QTY": mu,
+                    "PRED_REV": chosen_price * mu,
+
                     "USED_CROSS_PRICE_MODEL": True,
+
+                    "OWN_ELASTICITY_RAW": None,
+                    "OWN_ELASTICITY_USED": None,
+                    "LOCAL_ELASTICITY": e_loc,
+                    "ELASTICITY_QUALITY": "OK",
+
+                    "DISCOUNT_DEPTH": discount_depth(chosen_price, float(reg_p)) if reg_p else 0.0,
+                    "PRICE_CHANGE_LOG": price_change_log(chosen_price, float(reg_p)) if reg_p else 0.0,
+                    "PROMO_DEPTH": discount_depth(chosen_price, float(reg_p)) * float(ps) if reg_p else 0.0,
                 })
+
                 used_in_cross.add((sku, str(store)))
 
-        # ---------- 2) остальные SKU: single fallback ----------
+        # ---- Single fallback ----
         for _, r in ctx.iterrows():
             sku = str(r["PRODUCT_CODE"])
             store = str(r["STORE"])
+            fam = str(r["FAMILY_CODE"])
+
             if (sku, store) in used_in_cross:
                 continue
 
             ranges = promo_map.get((sku, store), [])
             promo_share = promo_share_in_range(ranges, start, end) if ranges else 0.0
 
-            # base price: последняя цена по бакету до today, иначе последняя известная
-            hist_b = train_all.loc[
-                (train_all["PRODUCT_CODE"] == sku) &
-                (train_all["STORE"] == store) &
-                (train_all["BUCKET"] == bucket)
-            ].sort_values("BUCKET_END")
-            if len(hist_b) and np.isfinite(hist_b["PRICE"].iloc[-1]):
-                base_price = float(hist_b["PRICE"].iloc[-1])
-            else:
-                hist_any = train_all.loc[
-                    (train_all["PRODUCT_CODE"] == sku) &
-                    (train_all["STORE"] == store)
-                ].sort_values("BUCKET_END")
-                base_price = float(hist_any["PRICE"].iloc[-1]) if len(hist_any) and np.isfinite(hist_any["PRICE"].iloc[-1]) else np.nan
+            base_p, stock_end = get_base_price_and_stock_end(train_all, sku, store, bucket, cutoff=cutoff)
 
-            if not np.isfinite(base_price) or base_price <= 0:
+            reg_p, reg_src = compute_reg_price(train_all, sku, store, bucket, cutoff=cutoff, base_price=base_p,
+                                               median_weeks=REG_PRICE_MEDIAN_WEEKS)
+            if not is_valid_price(reg_p):
                 continue
-
-            # stock cap
-            hist_any2 = train_all.loc[
-                (train_all["PRODUCT_CODE"] == sku) &
-                (train_all["STORE"] == store)
-            ].sort_values("BUCKET_END")
-            stock_cap = float(hist_any2["STOCK_END"].iloc[-1]) if len(hist_any2) else None
 
             base_row = r.copy()
             base_row["PROMO_SHARE"] = promo_share
 
-            ladder = fam_ladder.get(str(r["FAMILY_CODE"]))
-            grid = build_price_grid(base_price, observed_prices=ladder)
+            ladder = fam_ladder.get(fam)
+            grid = build_price_grid(float(reg_p), observed_prices=ladder)
 
-            best = optimize_price_single_sku(
+            res = optimize_single(
                 base_row=base_row,
-                feature_names=single_feature_names,
-                models=hier_models,
-                price_grid=grid,
-                stock_cap=stock_cap,
-                shrink_k=shrink_k
+                bucket=bucket,
+                week_monday=week_monday,
+                promo_share=promo_share,
+                feature_names=feature_names,
+                hier=hier,
+                grid=grid,
+                reg_price=float(reg_p),
+                stock_cap_end=stock_end
             )
-            if best is None:
+            if res is None:
                 continue
-
-            chosen_price, pred_qty, pred_rev = best
 
             out_rows.append({
                 "PRODUCT_CODE": sku,
                 "STORE": store,
-                "FAMILY_CODE": str(r["FAMILY_CODE"]),
+                "FAMILY_CODE": fam,
+
                 "AS_OF_DATE": today,
-                "TARGET_WEEK": pd.Timestamp(target_week),
+                "TARGET_WEEK": week_monday,
                 "TARGET_BUCKET": bucket,
                 "BUCKET_START": start,
                 "BUCKET_END": end,
-                "DECISION_CUTOFF_RULE": pd.Timestamp(decision_cutoff).normalize(),
-                "CUTOFF_EFFECTIVE": cutoff_effective,
+
+                "DECISION_CUTOFF_RULE": cutoff_rule,
+                "CUTOFF_EFFECTIVE": cutoff,
+
                 "PROMO_SHARE": promo_share,
-                "STOCK_CAP": stock_cap,
-                "BASE_PRICE": float(base_price),
-                "CHOSEN_PRICE": chosen_price,
-                "PRED_QTY": pred_qty,
-                "PRED_REV": pred_rev,
+                "STOCK_END_BUCKET_CAP": stock_end,
+
+                "BASE_PRICE": base_p,
+                "REG_PRICE": float(reg_p),
+                "REG_PRICE_SOURCE": reg_src,
+
+                "PROMO_CAP_PRICE": res.get("PROMO_CAP_PRICE"),
+                "PROMO_PRICE_CAPPED": bool(promo_share > PROMO_THRESHOLD and is_valid_price(res.get("PROMO_CAP_PRICE"))),
+
+                "CHOSEN_PRICE": float(res["CHOSEN_PRICE"]),
+                "PRICE_MULT": float(res["CHOSEN_PRICE"]) / max(float(reg_p), 1e-6),
+
+                "PRED_QTY": float(res["PRED_QTY"]),
+                "PRED_REV": float(res["PRED_REV"]),
+
                 "USED_CROSS_PRICE_MODEL": False,
+
+                "OWN_ELASTICITY_RAW": res["OWN_ELASTICITY_RAW"],
+                "OWN_ELASTICITY_USED": res["OWN_ELASTICITY_USED"],
+                "LOCAL_ELASTICITY": res["LOCAL_ELASTICITY"],
+                "ELASTICITY_QUALITY": res["ELASTICITY_QUALITY"],
+
+                "USED_LEVEL": res["USED_LEVEL"],
+                "POS_SALES_USED": res["POS_SALES_USED"],
+
+                "DISCOUNT_DEPTH": res["DISCOUNT_DEPTH"],
+                "PRICE_CHANGE_LOG": res["PRICE_CHANGE_LOG"],
+                "PROMO_DEPTH": res["PROMO_DEPTH"],
             })
-
-        out_all.append(pd.DataFrame(out_rows))
-
-    return pd.concat(out_all, ignore_index=True) if out_all else pd.DataFrame()
-
-
-# =========================
-# Rolling backtest (опционально)
-# =========================
-
-def last_n_weeks(weeks: Iterable[pd.Timestamp], n: int) -> List[pd.Timestamp]:
-    """Последние n уникальных недель (по возрастанию)."""
-    u = sorted(pd.Series(list(weeks)).dropna().unique())
-    return u[-n:]
-
-
-def rolling_backtest_12w(bucket_df: pd.DataFrame,
-                         daily_df: pd.DataFrame,
-                         eval_weeks: int = 12,
-                         shrink_k: int = DEFAULT_SHRINK_K,
-                         alpha: float = POISSON_ALPHA) -> pd.DataFrame:
-    """
-    Rolling backtest последних eval_weeks недель.
-    Тут оставлено просто как базовая проверка (можно расширять).
-
-    Важно: backtest медленнее прода, потому что обучаем модели много раз.
-    """
-    bdf = bucket_df.loc[bucket_df["BUCKET_END"] <= HISTORY_END].copy()
-    promo_map = build_promo_map(daily_df)
-
-    single_feature_names = [
-        "LOG_PRICE", "PROMO_SHARE", "BUCKET_IDX", "WEEK_OF_YEAR",
-        "LOW_STOCK_FLAG", "QTY_L1", "PRICE_L1", "PROMO_L1"
-    ]
-    fam_ladder_all = collect_observed_price_ladder(bdf, level="FAMILY_CODE")
-
-    weeks = last_n_weeks(bdf["WEEK"].unique(), eval_weeks)
-    out_rows: List[dict] = []
-
-    for wk in weeks:
-        wk = pd.Timestamp(wk)
-        for bucket in BUCKET_ORDER:
-            start, end = bucket_start_end(wk, bucket)
-            cutoff = min(decision_cutoff_for_bucket(wk, bucket), HISTORY_END)
-
-            train = bdf.loc[bdf["BUCKET_END"] <= cutoff].copy()
-            if len(train) == 0:
-                continue
-
-            # single models
-            hier = train_hier_models(train, cutoff=cutoff, feature_names=single_feature_names, alpha=alpha)
-
-            # target rows
-            target = bdf.loc[(bdf["WEEK"] == wk) & (bdf["BUCKET"] == bucket)].copy()
-            if len(target) == 0:
-                continue
-
-            for _, r in target.iterrows():
-                sku = str(r["PRODUCT_CODE"])
-                store = str(r["STORE"])
-                fam = str(r["FAMILY_CODE"])
-
-                ranges = promo_map.get((sku, store), [])
-                promo_share = promo_share_in_range(ranges, start, end) if ranges else float(r.get("PROMO_SHARE", 0.0))
-
-                # base price
-                hist_b = train.loc[
-                    (train["PRODUCT_CODE"] == sku) &
-                    (train["STORE"] == store) &
-                    (train["BUCKET"] == bucket)
-                ].sort_values("BUCKET_END")
-                base_price = float(hist_b["PRICE"].iloc[-1]) if len(hist_b) and np.isfinite(hist_b["PRICE"].iloc[-1]) else float(r["PRICE"])
-                if not np.isfinite(base_price) or base_price <= 0:
-                    continue
-
-                # stock cap
-                hist_any = train.loc[
-                    (train["PRODUCT_CODE"] == sku) &
-                    (train["STORE"] == store)
-                ].sort_values("BUCKET_END")
-                stock_cap = float(hist_any["STOCK_END"].iloc[-1]) if len(hist_any) else None
-
-                base_row = r.copy()
-                base_row["PROMO_SHARE"] = promo_share
-
-                ladder = fam_ladder_all.get(fam)
-                grid = build_price_grid(base_price, observed_prices=ladder)
-
-                best = optimize_price_single_sku(
-                    base_row=base_row,
-                    feature_names=single_feature_names,
-                    models=hier,
-                    price_grid=grid,
-                    stock_cap=stock_cap,
-                    shrink_k=shrink_k
-                )
-                if best is None:
-                    continue
-
-                chosen_price, pred_qty, pred_rev = best
-                out_rows.append({
-                    "PRODUCT_CODE": sku,
-                    "STORE": store,
-                    "FAMILY_CODE": fam,
-                    "WEEK": wk,
-                    "BUCKET": bucket,
-                    "CUTOFF": cutoff,
-                    "CHOSEN_PRICE": chosen_price,
-                    "PRED_QTY": pred_qty,
-                    "PRED_REV": pred_rev,
-                    "ACTUAL_QTY": float(r["QTY"]),
-                    "ACTUAL_PRICE": float(r["PRICE"]) if np.isfinite(r["PRICE"]) else np.nan,
-                })
 
     return pd.DataFrame(out_rows)
 
 
+def run_for_weeks(bucket_df: pd.DataFrame,
+                  daily_df: pd.DataFrame,
+                  as_of_date: pd.Timestamp,
+                  mode: str,
+                  weeks_back: int = 0) -> pd.DataFrame:
+    today = pd.Timestamp(as_of_date).normalize()
+    frames = []
+    for w in range(0, int(weeks_back) + 1):
+        wk = week_start(today) - pd.Timedelta(weeks=w)
+        df_w = calculate_for_week(bucket_df, daily_df, today, wk, mode)
+        if len(df_w) > 0:
+            df_w["WEEKS_BACK"] = w
+            df_w["RUN_MODE"] = mode
+            frames.append(df_w)
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
 # =========================
-# Пайплайн
+# Pipeline
 # =========================
 
 def run_pipeline(df_raw: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Полный пайплайн:
-      1) preprocess daily
-      2) aggregate to buckets
-      3) add lags
-
-    Returns:
-      (bucket_panel, daily_clean)
-    """
     daily = preprocess_raw(df_raw, history_end=HISTORY_END)
     buckets = aggregate_to_buckets(daily)
     buckets = add_lag_features(buckets, lags=1)
     return buckets, daily
 
 
-# ------------------------------------------------------------
-# Пример использования:
-#
-# import pandas as pd
-# df = pd.read_parquet("data.parquet")
-# bucket_panel, daily = run_pipeline(df)
-#
-# # Понедельник утром:
-# decisions = price_week_3_buckets(bucket_panel, daily, as_of_date=pd.Timestamp("2025-09-15"))
-# decisions.to_csv("week_prices.csv", index=False)
-#
-# # Опционально backtest:
-# bt = rolling_backtest_12w(bucket_panel, daily, eval_weeks=12)
-# ------------------------------------------------------------
+# =========================
+# Пример использования
+# =========================
+
+"""
+1) Собираем bucket-таблицу и daily:
+    buckets_df, daily_df = run_pipeline(df_raw)
+
+2) Запуск в понедельник утром (считаем цены на MON_THU) и, например, ещё на 2 предыдущие недели:
+    out_mon = run_for_weeks(
+        bucket_df=buckets_df,
+        daily_df=daily_df,
+        as_of_date=pd.Timestamp("2026-02-12"),  # дата запуска (факт. "сегодня")
+        mode="monday",
+        weeks_back=2
+    )
+
+3) Запуск в пятницу утром (считаем цены на FRI и SAT_SUN) с тем же weeks_back:
+    out_fri = run_for_weeks(
+        bucket_df=buckets_df,
+        daily_df=daily_df,
+        as_of_date=pd.Timestamp("2026-02-16"),
+        mode="friday",
+        weeks_back=2
+    )
+
+4) Дальше можно объединить:
+    out_all = pd.concat([out_mon, out_fri], ignore_index=True)
+
+Ключевые колонки результата:
+- TARGET_BUCKET, BUCKET_START/END
+- REG_PRICE, REG_PRICE_SOURCE (как нашли регулярную цену)
+- PROMO_SHARE, PROMO_CAP_PRICE, PROMO_PRICE_CAPPED
+- CHOSEN_PRICE, PRICE_MULT
+- USED_CROSS_PRICE_MODEL (учли ли каннибализацию)
+- OWN_ELASTICITY_*, LOCAL_ELASTICITY
+"""
