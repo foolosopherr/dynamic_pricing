@@ -448,6 +448,47 @@ def add_lag_features(bucket_df: pd.DataFrame, lags: int = 1) -> pd.DataFrame:
 # Models
 # =========================
 
+def add_training_regular_price_features(bucket_df: pd.DataFrame,
+                                        median_weeks: int = REG_PRICE_MEDIAN_WEEKS,
+                                        min_points: int = REG_PRICE_MIN_POINTS) -> pd.DataFrame:
+    """
+    Добавляет в bucket_df "обучающие" аналоги regular-price фичей:
+      - REG_PRICE_TRAIN: регулярная цена (медиана цены за последние N недель, без текущей точки)
+      - DISCOUNT_DEPTH: max(1 - PRICE/REG_PRICE_TRAIN, 0)
+      - PRICE_CHANGE_LOG: log(PRICE) - log(REG_PRICE_TRAIN)
+      - PROMO_DEPTH: DISCOUNT_DEPTH * PROMO_SHARE
+
+    Это нужно, чтобы те же фичи существовали и в train, и в scoring.
+    """
+    d = bucket_df.copy().sort_values(["PRODUCT_CODE", "STORE", "BUCKET", "WEEK"])
+
+    # rolling median регулярной цены (по SKU+STORE+BUCKET), исключая текущую неделю
+    grp = d.groupby(["PRODUCT_CODE", "STORE", "BUCKET"], sort=False)
+    roll = (
+        grp["PRICE"]
+        .apply(lambda s: s.shift(1).rolling(window=int(median_weeks), min_periods=int(min_points)).median())
+        .reset_index(level=[0, 1, 2], drop=True)
+    )
+    d["REG_PRICE_TRAIN"] = roll
+
+    # fallback: если медианы нет, используем прошлую цену (PRICE_L1), а если и её нет — текущую PRICE
+    if "PRICE_L1" in d.columns:
+        d["REG_PRICE_TRAIN"] = d["REG_PRICE_TRAIN"].fillna(d["PRICE_L1"])
+    d["REG_PRICE_TRAIN"] = d["REG_PRICE_TRAIN"].fillna(d["PRICE"])
+
+    # безопасные вычисления
+    rp = pd.to_numeric(d["REG_PRICE_TRAIN"], errors="coerce").astype(float)
+    p = pd.to_numeric(d["PRICE"], errors="coerce").astype(float)
+
+    rp = rp.where(np.isfinite(rp) & (rp > 0), np.nan)
+    p = p.where(np.isfinite(p) & (p > 0), np.nan)
+
+    d["DISCOUNT_DEPTH"] = (1.0 - (p / rp)).clip(lower=0.0).fillna(0.0)
+    d["PRICE_CHANGE_LOG"] = (p.apply(_safe_log) - rp.apply(_safe_log)).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    d["PROMO_DEPTH"] = (d["DISCOUNT_DEPTH"] * pd.to_numeric(d.get("PROMO_SHARE", 0.0), errors="coerce").fillna(0.0)).astype(float)
+
+    return d
+
 @dataclass
 class PoissonModel:
     reg: PoissonRegressor
@@ -459,16 +500,22 @@ class PoissonModel:
 
 def fit_poisson(df: pd.DataFrame, feature_names: List[str], alpha: float = POISSON_ALPHA) -> Optional[PoissonModel]:
     g = df.copy()
+
+    # FIX: если фич нет (например, модель обучают на "сыром" bucket_df), добавим их локально
+    need = {"DISCOUNT_DEPTH", "PRICE_CHANGE_LOG", "PROMO_DEPTH"}
+    if len(need - set(g.columns)) > 0:
+        g = add_training_regular_price_features(g)
+
     g = g.loc[np.isfinite(g["PRICE"].values) & (g["PRICE"].values > 0)]
     if len(g) < 20:
         return None
 
     g["LOG_PRICE"] = g["PRICE"].astype(float).apply(_safe_log)
-
     y = np.clip(g["QTY"].astype(float).values, 0.0, None)
     if not np.isfinite(y).all():
         return None
 
+    # теперь колонки гарантированно существуют
     X = g[feature_names].astype(float).replace([np.inf, -np.inf], np.nan).fillna(0.0).values
 
     scaler = StandardScaler()
@@ -535,6 +582,8 @@ def train_hier_dual_models(bucket_df: pd.DataFrame,
                            alpha: float = POISSON_ALPHA) -> HierDualModels:
     train = bucket_df.loc[bucket_df["BUCKET_END"] <= pd.Timestamp(cutoff)].copy()
 
+    train = add_training_regular_price_features(train)
+    
     global_models: Dict[str, DualModels] = {}
     for b, g in train.groupby("BUCKET"):
         if len(g) >= MIN_ROWS_GLOBAL:
@@ -1064,8 +1113,21 @@ def train_cross_family_models(bucket_df: pd.DataFrame,
     return out
 
 
-def predict_family_demands(cfm: CrossFamilyModel, prices: Dict[str, float]) -> Dict[str, float]:
-    X_raw = np.array([_safe_log(prices[sku]) for sku in cfm.family_products], dtype=float).reshape(1, -1)
+def predict_family_demands(cfm: CrossFamilyModel,
+                           prices: Dict[str, float],
+                           default_price: Optional[float] = None) -> Dict[str, float]:
+    """
+    Безопасный прогноз family-demand:
+    - если для SKU нет цены в prices, используем default_price
+    - default_price если не задан: медиана цен из prices
+    """
+    if default_price is None:
+        default_price = float(np.median(list(prices.values()))) if prices else 1.0
+
+    # строим X по всем SKU в family_products, подставляя fallback если нет значения
+    X_raw = np.array([_safe_log(prices.get(sku, default_price)) for sku in cfm.family_products],
+                     dtype=float).reshape(1, -1)
+
     Xs = cfm.scaler.transform(X_raw)
     out: Dict[str, float] = {}
     for sku, reg in cfm.models_by_product.items():
@@ -1197,6 +1259,8 @@ def calculate_for_week(bucket_df: pd.DataFrame,
 
             prices = {sku: float(reg_prices[sku]) for sku in active}
 
+            default_price = float(np.median(list(prices.values()))) if prices else 1.0
+
             for _ in range(CROSS_ITERS):
                 for sku in active:
                     grid = grids.get(sku)
@@ -1206,7 +1270,7 @@ def calculate_for_week(bucket_df: pd.DataFrame,
                     for p in grid:
                         tmp = dict(prices)
                         tmp[sku] = float(p)
-                        mu = float(predict_family_demands(cfm, tmp).get(sku, 0.0))
+                        mu = float(predict_family_demands(cfm, tmp, default_price=default_price).get(sku, 0.0))
 
                         cap = stock_caps.get(sku)
                         if cap is not None and np.isfinite(cap):
@@ -1218,7 +1282,7 @@ def calculate_for_week(bucket_df: pd.DataFrame,
                     if best is not None:
                         prices[sku] = best[1]
 
-            mu_all = predict_family_demands(cfm, prices)
+            mu_all = predict_family_demands(cfm, prices, default_price=default_price)
 
             for _, rr in gfam.iterrows():
                 sku = str(rr["PRODUCT_CODE"])
@@ -1243,8 +1307,8 @@ def calculate_for_week(bucket_df: pd.DataFrame,
                 p_hi = p * (1.0 + LOCAL_ELASTICITY_DELTA)
                 tmp_lo = dict(prices); tmp_lo[sku] = p_lo
                 tmp_hi = dict(prices); tmp_hi[sku] = p_hi
-                mu_lo = float(predict_family_demands(cfm, tmp_lo).get(sku, 0.0))
-                mu_hi = float(predict_family_demands(cfm, tmp_hi).get(sku, 0.0))
+                mu_lo = float(predict_family_demands(cfm, tmp_lo, default_price=default_price).get(sku, 0.0))
+                mu_hi = float(predict_family_demands(cfm, tmp_hi, default_price=default_price).get(sku, 0.0))
                 if stock_end is not None and np.isfinite(stock_end):
                     mu_lo = min(mu_lo, float(stock_end))
                     mu_hi = min(mu_hi, float(stock_end))
@@ -1446,132 +1510,6 @@ def run_pipeline(df_raw: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
 - USED_CROSS_PRICE_MODEL (учли ли каннибализацию)
 - OWN_ELASTICITY_*, LOCAL_ELASTICITY
 """
-
-
-
-
-
-
-
-# === FIX (v5): add missing training-time features DISCOUNT_DEPTH / PRICE_CHANGE_LOG / PROMO_DEPTH ===
-# Причина: эти фичи создавались только при scoring кандидатов, но не были рассчитаны в train-таблице,
-# поэтому g[feature_names] падал с "not in index".
-
-def add_training_regular_price_features(bucket_df: pd.DataFrame,
-                                        median_weeks: int = REG_PRICE_MEDIAN_WEEKS,
-                                        min_points: int = REG_PRICE_MIN_POINTS) -> pd.DataFrame:
-    """
-    Добавляет в bucket_df "обучающие" аналоги regular-price фичей:
-      - REG_PRICE_TRAIN: регулярная цена (медиана цены за последние N недель, без текущей точки)
-      - DISCOUNT_DEPTH: max(1 - PRICE/REG_PRICE_TRAIN, 0)
-      - PRICE_CHANGE_LOG: log(PRICE) - log(REG_PRICE_TRAIN)
-      - PROMO_DEPTH: DISCOUNT_DEPTH * PROMO_SHARE
-
-    Это нужно, чтобы те же фичи существовали и в train, и в scoring.
-    """
-    d = bucket_df.copy().sort_values(["PRODUCT_CODE", "STORE", "BUCKET", "WEEK"])
-
-    # rolling median регулярной цены (по SKU+STORE+BUCKET), исключая текущую неделю
-    grp = d.groupby(["PRODUCT_CODE", "STORE", "BUCKET"], sort=False)
-    roll = (
-        grp["PRICE"]
-        .apply(lambda s: s.shift(1).rolling(window=int(median_weeks), min_periods=int(min_points)).median())
-        .reset_index(level=[0, 1, 2], drop=True)
-    )
-    d["REG_PRICE_TRAIN"] = roll
-
-    # fallback: если медианы нет, используем прошлую цену (PRICE_L1), а если и её нет — текущую PRICE
-    if "PRICE_L1" in d.columns:
-        d["REG_PRICE_TRAIN"] = d["REG_PRICE_TRAIN"].fillna(d["PRICE_L1"])
-    d["REG_PRICE_TRAIN"] = d["REG_PRICE_TRAIN"].fillna(d["PRICE"])
-
-    # безопасные вычисления
-    rp = pd.to_numeric(d["REG_PRICE_TRAIN"], errors="coerce").astype(float)
-    p = pd.to_numeric(d["PRICE"], errors="coerce").astype(float)
-
-    rp = rp.where(np.isfinite(rp) & (rp > 0), np.nan)
-    p = p.where(np.isfinite(p) & (p > 0), np.nan)
-
-    d["DISCOUNT_DEPTH"] = (1.0 - (p / rp)).clip(lower=0.0).fillna(0.0)
-    d["PRICE_CHANGE_LOG"] = (p.apply(_safe_log) - rp.apply(_safe_log)).replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    d["PROMO_DEPTH"] = (d["DISCOUNT_DEPTH"] * pd.to_numeric(d.get("PROMO_SHARE", 0.0), errors="coerce").fillna(0.0)).astype(float)
-
-    return d
-
-
-# --- 1) В train_hier_dual_models() добавь одну строку сразу после train = ... ---
-def train_hier_dual_models(bucket_df: pd.DataFrame,
-                           cutoff: pd.Timestamp,
-                           feature_names: List[str],
-                           alpha: float = POISSON_ALPHA) -> HierDualModels:
-    train = bucket_df.loc[bucket_df["BUCKET_END"] <= pd.Timestamp(cutoff)].copy()
-
-    # FIX: добавляем недостающие фичи для обучения (чтобы X = g[feature_names] работал)
-    train = add_training_regular_price_features(train)
-
-    # ... дальше код без изменений ...
-
-
-# --- 2) На всякий случай сделай защиту в fit_poisson() (если кто-то забудет вызвать функцию выше) ---
-def fit_poisson(df: pd.DataFrame, feature_names: List[str], alpha: float = POISSON_ALPHA) -> Optional[PoissonModel]:
-    g = df.copy()
-
-    # FIX: если фич нет (например, модель обучают на "сыром" bucket_df), добавим их локально
-    need = {"DISCOUNT_DEPTH", "PRICE_CHANGE_LOG", "PROMO_DEPTH"}
-    if len(need - set(g.columns)) > 0:
-        g = add_training_regular_price_features(g)
-
-    g = g.loc[np.isfinite(g["PRICE"].values) & (g["PRICE"].values > 0)]
-    if len(g) < 20:
-        return None
-
-    g["LOG_PRICE"] = g["PRICE"].astype(float).apply(_safe_log)
-    y = np.clip(g["QTY"].astype(float).values, 0.0, None)
-    if not np.isfinite(y).all():
-        return None
-
-    # теперь колонки гарантированно существуют
-    X = g[feature_names].astype(float).replace([np.inf, -np.inf], np.nan).fillna(0.0).values
-
-    scaler = StandardScaler()
-    Xs = scaler.fit_transform(X)
-
-    reg = PoissonRegressor(alpha=max(alpha, 1e-2), fit_intercept=True, max_iter=POISSON_MAX_ITER)
-    reg.fit(Xs, y)
-
-    return PoissonModel(reg, scaler, list(feature_names), int(len(g)), int((y > 0).sum()))
-
-
-
-
-def fit_poisson(df: pd.DataFrame, feature_names: List[str], alpha: float = POISSON_ALPHA) -> Optional[PoissonModel]:
-    g = df.copy()
-
-    # FIX: если фич нет (например, модель обучают на "сыром" bucket_df), добавим их локально
-    need = {"DISCOUNT_DEPTH", "PRICE_CHANGE_LOG", "PROMO_DEPTH"}
-    if len(need - set(g.columns)) > 0:
-        g = add_training_regular_price_features(g)
-
-    g = g.loc[np.isfinite(g["PRICE"].values) & (g["PRICE"].values > 0)]
-    if len(g) < 20:
-        return None
-
-    g["LOG_PRICE"] = g["PRICE"].astype(float).apply(_safe_log)
-    y = np.clip(g["QTY"].astype(float).values, 0.0, None)
-    if not np.isfinite(y).all():
-        return None
-
-    # теперь колонки гарантированно существуют
-    X = g[feature_names].astype(float).replace([np.inf, -np.inf], np.nan).fillna(0.0).values
-
-    scaler = StandardScaler()
-    Xs = scaler.fit_transform(X)
-
-    reg = PoissonRegressor(alpha=max(alpha, 1e-2), fit_intercept=True, max_iter=POISSON_MAX_ITER)
-    reg.fit(Xs, y)
-
-    return PoissonModel(reg, scaler, list(feature_names), int(len(g)), int((y > 0).sum()))
-
 
 
 
