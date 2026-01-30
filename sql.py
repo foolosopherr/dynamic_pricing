@@ -1,77 +1,60 @@
 
-import numpy as np
 import pandas as pd
+import numpy as np
 
-def add_prev_bucket_prices(df_now: pd.DataFrame, df_sales: pd.DataFrame) -> pd.DataFrame:
-    df_now = df_now.copy()
-    df_sales = df_sales.copy()
+def fill_missing_dates_per_product(
+    df: pd.DataFrame,
+    product_col: str = "PRODUCT_CODE",
+    date_col: str = "TRADE_DT",
+    qty_col: str = "QTY",
+    freq: str = "D",
+) -> pd.DataFrame:
+    df = df.copy()
 
-    # --- types
-    df_now["PRODUCT_CODE"] = df_now["PRODUCT_CODE"].astype(str)
-    df_sales["PRODUCT_CODE"] = df_sales["PRODUCT_CODE"].astype(str)
+    # 1) types
+    df[product_col] = df[product_col].astype(str)
+    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
 
-    df_now["MONDAY_DATE"] = pd.to_datetime(df_now["MONDAY_DATE"], errors="coerce")
-    df_sales["TRADE_DT"] = pd.to_datetime(df_sales["TRADE_DT"], errors="coerce")
+    # уберём битые даты
+    df = df[df[date_col].notna()].copy()
 
-    # --- (важно) выкидываем нулевые продажи
-    df_sales = df_sales[df_sales["SALE_QTY"] > 0].copy()
+    # 2) уберём возможные дубликаты одной даты на товар:
+    #    если их может быть несколько — выбери агрегирование.
+    #    здесь: суммируем QTY, а остальное берём "последнее"
+    other_cols = [c for c in df.columns if c not in [product_col, date_col, qty_col]]
+    if df.duplicated([product_col, date_col]).any():
+        df = (df.sort_values([product_col, date_col])
+                .groupby([product_col, date_col], as_index=False)
+                .agg({**{qty_col: "sum"}, **{c: "last" for c in other_cols}}))
 
-    # --- prev day per bucket
-    offset_map = {"MON_THU": -1, "FRI": 3, "SAT_SUN": 4}
-    df_now["PREV_BUCKET_LAST_DAY"] = df_now["MONDAY_DATE"] + pd.to_timedelta(
-        df_now["BUCKET_NOW"].map(offset_map).astype("int16"), unit="D"
-    )
+    # 3) основной шаг: для каждого продукта — полный daily диапазон и ffill значений
+    df = df.sort_values([product_col, date_col])
 
-    # --- (рекомендация) проверь, что история df_sales покрывает нужный диапазон
-    # минимум нужен до max(prev_day), и желательно иметь lookback до min(prev_day)
-    # print(df_sales["TRADE_DT"].min(), df_sales["TRADE_DT"].max())
-    # print(df_now["PREV_BUCKET_LAST_DAY"].min(), df_now["PREV_BUCKET_LAST_DAY"].max())
+    def _expand_one(g: pd.DataFrame) -> pd.DataFrame:
+        g = g.set_index(date_col)
 
-    # --- prepare result arrays
-    sale_prev = np.full(len(df_now), np.nan, dtype="float64")
-    base_prev = np.full(len(df_now), np.nan, dtype="float64")
+        full_idx = pd.date_range(g.index.min(), g.index.max(), freq=freq)
+        g2 = g.reindex(full_idx)
 
-    # --- sort once
-    df_sales.sort_values(["PRODUCT_CODE", "TRADE_DT"], inplace=True)
+        # QTY: для сгенерированных дат -> 0
+        g2[qty_col] = g2[qty_col].fillna(0)
 
-    # --- group indices for df_now by product (чтобы не делать apply по строкам)
-    now_groups = df_now.groupby("PRODUCT_CODE", sort=False).indices
+        # остальные колонки: ffill (протянуть последнее известное значение)
+        for c in other_cols:
+            g2[c] = g2[c].ffill()
 
-    # --- build dict of sales arrays per product
-    # (быстро и память-эффективно, чем гигантский merge)
-    sales_groups = {k: g for k, g in df_sales.groupby("PRODUCT_CODE", sort=False)}
+        g2[product_col] = g[product_col].iloc[0]
+        g2.index.name = date_col
+        return g2.reset_index()
 
-    for prod, idx in now_groups.items():
-        g = sales_groups.get(prod)
-        if g is None or g.empty:
-            continue  # останется NaN => потом можно превратить в None
+    out = (df.groupby(product_col, group_keys=False, sort=False)
+             .apply(_expand_one))
 
-        trade = g["TRADE_DT"].to_numpy(dtype="datetime64[ns]")
-        sp = g["SALE_PRICE"].to_numpy()
-        bp = g["BASE_PRICE"].to_numpy()
-
-        prev_days = df_now.loc[idx, "PREV_BUCKET_LAST_DAY"].to_numpy(dtype="datetime64[ns]")
-
-        # last trade_dt <= prev_day
-        pos = np.searchsorted(trade, prev_days, side="right") - 1
-        ok = pos >= 0
-
-        sale_prev[idx] = np.where(ok, sp[pos], np.nan)
-        base_prev[idx] = np.where(ok, bp[pos], np.nan)
-
-    out = df_now.copy()
-    out["SALE_PRICE_PREV_BUCKET"] = sale_prev
-    out["BASE_PRICE_PREV_BUCKET"] = base_prev
-
-    # если хочешь именно None (а не NaN) — конвертни:
-    out["SALE_PRICE_PREV_BUCKET"] = out["SALE_PRICE_PREV_BUCKET"].where(
-        pd.notnull(out["SALE_PRICE_PREV_BUCKET"]), None
-    )
-    out["BASE_PRICE_PREV_BUCKET"] = out["BASE_PRICE_PREV_BUCKET"].where(
-        pd.notnull(out["BASE_PRICE_PREV_BUCKET"]), None
-    )
+    # (опционально) привести TRADE_DT к date, если нужно
+    out[date_col] = out[date_col].dt.date
 
     return out
+
 
 
 
