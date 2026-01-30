@@ -1,3 +1,88 @@
+
+import numpy as np
+import pandas as pd
+
+def add_prev_bucket_prices(df_now: pd.DataFrame, df_sales: pd.DataFrame) -> pd.DataFrame:
+    df_now = df_now.copy()
+    df_sales = df_sales.copy()
+
+    # --- types
+    df_now["PRODUCT_CODE"] = df_now["PRODUCT_CODE"].astype(str)
+    df_sales["PRODUCT_CODE"] = df_sales["PRODUCT_CODE"].astype(str)
+
+    df_now["MONDAY_DATE"] = pd.to_datetime(df_now["MONDAY_DATE"], errors="coerce")
+    df_sales["TRADE_DT"] = pd.to_datetime(df_sales["TRADE_DT"], errors="coerce")
+
+    # --- (важно) выкидываем нулевые продажи
+    df_sales = df_sales[df_sales["SALE_QTY"] > 0].copy()
+
+    # --- prev day per bucket
+    offset_map = {"MON_THU": -1, "FRI": 3, "SAT_SUN": 4}
+    df_now["PREV_BUCKET_LAST_DAY"] = df_now["MONDAY_DATE"] + pd.to_timedelta(
+        df_now["BUCKET_NOW"].map(offset_map).astype("int16"), unit="D"
+    )
+
+    # --- (рекомендация) проверь, что история df_sales покрывает нужный диапазон
+    # минимум нужен до max(prev_day), и желательно иметь lookback до min(prev_day)
+    # print(df_sales["TRADE_DT"].min(), df_sales["TRADE_DT"].max())
+    # print(df_now["PREV_BUCKET_LAST_DAY"].min(), df_now["PREV_BUCKET_LAST_DAY"].max())
+
+    # --- prepare result arrays
+    sale_prev = np.full(len(df_now), np.nan, dtype="float64")
+    base_prev = np.full(len(df_now), np.nan, dtype="float64")
+
+    # --- sort once
+    df_sales.sort_values(["PRODUCT_CODE", "TRADE_DT"], inplace=True)
+
+    # --- group indices for df_now by product (чтобы не делать apply по строкам)
+    now_groups = df_now.groupby("PRODUCT_CODE", sort=False).indices
+
+    # --- build dict of sales arrays per product
+    # (быстро и память-эффективно, чем гигантский merge)
+    sales_groups = {k: g for k, g in df_sales.groupby("PRODUCT_CODE", sort=False)}
+
+    for prod, idx in now_groups.items():
+        g = sales_groups.get(prod)
+        if g is None or g.empty:
+            continue  # останется NaN => потом можно превратить в None
+
+        trade = g["TRADE_DT"].to_numpy(dtype="datetime64[ns]")
+        sp = g["SALE_PRICE"].to_numpy()
+        bp = g["BASE_PRICE"].to_numpy()
+
+        prev_days = df_now.loc[idx, "PREV_BUCKET_LAST_DAY"].to_numpy(dtype="datetime64[ns]")
+
+        # last trade_dt <= prev_day
+        pos = np.searchsorted(trade, prev_days, side="right") - 1
+        ok = pos >= 0
+
+        sale_prev[idx] = np.where(ok, sp[pos], np.nan)
+        base_prev[idx] = np.where(ok, bp[pos], np.nan)
+
+    out = df_now.copy()
+    out["SALE_PRICE_PREV_BUCKET"] = sale_prev
+    out["BASE_PRICE_PREV_BUCKET"] = base_prev
+
+    # если хочешь именно None (а не NaN) — конвертни:
+    out["SALE_PRICE_PREV_BUCKET"] = out["SALE_PRICE_PREV_BUCKET"].where(
+        pd.notnull(out["SALE_PRICE_PREV_BUCKET"]), None
+    )
+    out["BASE_PRICE_PREV_BUCKET"] = out["BASE_PRICE_PREV_BUCKET"].where(
+        pd.notnull(out["BASE_PRICE_PREV_BUCKET"]), None
+    )
+
+    return out
+
+
+
+
+
+
+
+
+
+
+
 N_JOBS = -1          # сколько потоков/процессов (-1 = все)
 PAR_BACKEND = "loky" # процессы (лучше для sklearn)
 
